@@ -1,190 +1,1173 @@
-import os, sqlite3, asyncio, logging
+import os
+import sqlite3
+import asyncio
+import logging
 from threading import Thread
+
 from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove,
+)
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+# ============================================================
+# AD FASHION HIJABS & MORE — TELEGRAM SHOP BOT — PHASE 2
+# ============================================================
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "6921853187"))
 PORT = int(os.environ.get("PORT", "10000"))
+
 NAME = "AD FASHION HIJABS & MORE"
 TAGLINE = "MODESTY • ELEGANCE • QUALITY"
-PHONE1, PHONE2 = "09136114700", "07011927516"
+PHONE1 = "09136114700"
+PHONE2 = "07011927516"
 WEBSITE = "https://adfashionhijabs.netlify.app/"
 ADDRESS = "Bauchi Central Market, Bauchi, Nigeria"
 WHATSAPP = "2349136114700"
 DB = "shop.db"
-logging.basicConfig(level=logging.INFO)
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+
+# -------------------- DATABASE --------------------
 
 def conn():
-    c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; return c
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    return c
+
+
 def init_db():
-    c=conn()
-    c.execute("CREATE TABLE IF NOT EXISTS products(id TEXT PRIMARY KEY,name TEXT,category TEXT,price INTEGER,description TEXT,photo_file_id TEXT,active INTEGER DEFAULT 1)")
-    c.execute("CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,username TEXT,customer_name TEXT,phone TEXT,address TEXT,items TEXT,total INTEGER,status TEXT DEFAULT 'NEW',created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-    starter=[("royal_blue_hijab","Royal Blue Hijab","hijabs",None,"Elegant royal blue hijab. Price on request."),
-             ("ismat_jilbab","Ismat Jilbab","jilbabs",24000,"Free-size maxi jilbab. Elegant, comfortable and modest.")]
-    for p in starter: c.execute("INSERT OR IGNORE INTO products(id,name,category,price,description) VALUES(?,?,?,?,?)",p)
-    c.commit(); c.close()
-def money(n): return "Price on request" if n is None else f"₦{n:,.0f}"
-def get_products(cat=None):
-    c=conn()
-    q="SELECT * FROM products WHERE active=1"+(" AND category=?" if cat else "")+" ORDER BY name"
-    r=c.execute(q,(cat,) if cat else ()).fetchall(); c.close(); return r
-def get_product(pid):
-    c=conn(); r=c.execute("SELECT * FROM products WHERE id=?",(pid,)).fetchone(); c.close(); return r
-def admin(u): return u.effective_user and u.effective_user.id==ADMIN_ID
+    c = conn()
 
-def menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛍️ Shop Products",callback_data="shop")],
-        [InlineKeyboardButton("🧕 Hijabs",callback_data="cat:hijabs"),InlineKeyboardButton("👗 Jilbabs",callback_data="cat:jilbabs")],
-        [InlineKeyboardButton("🧵 Textiles",callback_data="cat:textiles"),InlineKeyboardButton("✨ More",callback_data="cat:more")],
-        [InlineKeyboardButton("🛒 My Cart",callback_data="cart"),InlineKeyboardButton("📦 My Orders",callback_data="orders")],
-        [InlineKeyboardButton("📞 Contact Us",callback_data="contact"),InlineKeyboardButton("📍 Location",callback_data="location")],
-        [InlineKeyboardButton("🌐 Visit Website",url=WEBSITE)]
-    ])
-def cat_menu(cat):
-    rows=get_products(cat); b=[[InlineKeyboardButton(f"{r['name']} — {money(r['price'])}",callback_data=f"product:{r['id']}")] for r in rows]
-    b.append([InlineKeyboardButton("⬅️ Main Menu",callback_data="home")]); return InlineKeyboardMarkup(b)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS products(
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            category TEXT NOT NULL,
+            price INTEGER,
+            description TEXT,
+            photo_file_id TEXT,
+            active INTEGER DEFAULT 1
+        )
+    """)
 
-async def start(u,ct):
-    await u.message.reply_text(f"🖤 *{NAME}*\n\n*{TAGLINE}*\n\nWelcome! Discover beautiful hijabs, jilbabs, textiles and more.\n\nChoose an option:",parse_mode=ParseMode.MARKDOWN,reply_markup=menu())
-async def shop(u,ct): await u.message.reply_text("🛍️ Choose a collection:",reply_markup=menu())
-async def help_cmd(u,ct): await u.message.reply_text("Use /start to open the shop.\nUse /shop to browse.\nUse /cart for your cart.\nUse /contact for contact details.")
-async def cart_cmd(u,ct): await show_cart(u,ct)
-async def orders_cmd(u,ct):
-    c=conn(); rows=c.execute("SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 10",(u.effective_user.id,)).fetchall(); c.close()
-    text="📦 You have no orders yet." if not rows else "📦 *Your recent orders*\n\n"+"\n".join(f"#{r['id']} — {money(r['total'])} — {r['status']}" for r in rows)
-    if u.callback_query: await u.callback_query.edit_message_text(text,parse_mode=ParseMode.MARKDOWN,reply_markup=menu())
-    else: await u.message.reply_text(text,parse_mode=ParseMode.MARKDOWN)
-async def contact_cmd(u,ct):
-    await u.message.reply_text(f"📞 *{NAME}*\n\n{PHONE1}\n{PHONE2}\n\nWhatsApp: https://wa.me/{WHATSAPP}\nWebsite: {WEBSITE}",parse_mode=ParseMode.MARKDOWN)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS orders(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            customer_name TEXT,
+            phone TEXT,
+            address TEXT,
+            items TEXT,
+            total INTEGER,
+            status TEXT DEFAULT 'PENDING',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
-async def buttons(u,ct):
-    q=u.callback_query; await q.answer(); d=q.data
-    if d=="home": await q.edit_message_text(f"🖤 *{NAME}*\n\n*{TAGLINE}*\n\nChoose an option:",parse_mode=ParseMode.MARKDOWN,reply_markup=menu())
-    elif d=="shop": await q.edit_message_text("🛍️ Choose a collection:",reply_markup=menu())
-    elif d.startswith("cat:"):
-        cat=d.split(":")[1]; labels={"hijabs":"🧕 Hijabs","jilbabs":"👗 Jilbabs","textiles":"🧵 Textiles","more":"✨ More"}
-        await q.edit_message_text(f"{labels.get(cat,cat)}\n\nSelect a product:",reply_markup=cat_menu(cat))
-    elif d.startswith("product:"):
-        p=get_product(d.split(":")[1])
-        if not p: return await q.edit_message_text("Product not found.",reply_markup=menu())
-        kb=InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Add to Cart",callback_data=f"add:{p['id']}")],
-                                 [InlineKeyboardButton("📲 Order Now",callback_data=f"add:{p['id']}:now")],
-                                 [InlineKeyboardButton("⬅️ Back",callback_data=f"cat:{p['category']}")]])
-        text=f"*{p['name']}*\n\n{p['description']}\n\n💰 *{money(p['price'])}*"
-        if p["photo_file_id"]:
-            await q.message.reply_photo(p["photo_file_id"],caption=text,parse_mode=ParseMode.MARKDOWN,reply_markup=kb)
-            try: await q.message.delete()
-            except: pass
-        else: await q.edit_message_text(text,parse_mode=ParseMode.MARKDOWN,reply_markup=kb)
-    elif d.startswith("add:"):
-        pid=d.split(":")[1]; ct.user_data.setdefault("cart",{}); ct.user_data["cart"][pid]=ct.user_data["cart"].get(pid,0)+1
-        if d.endswith(":now"): await checkout(u,ct)
-        else: await q.edit_message_text("✅ Added to your cart.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛒 View Cart",callback_data="cart")],[InlineKeyboardButton("🛍️ Continue Shopping",callback_data="shop")]]))
-    elif d=="cart": await show_cart(u,ct)
-    elif d=="checkout": await checkout(u,ct)
-    elif d=="clear": ct.user_data["cart"]={}; await q.edit_message_text("🛒 Your cart is empty.",reply_markup=menu())
-    elif d=="orders": await orders_cmd(u,ct)
-    elif d=="contact": await q.edit_message_text(f"📞 *{NAME}*\n\n{PHONE1}\n{PHONE2}\n\nWhatsApp: https://wa.me/{WHATSAPP}\nWebsite: {WEBSITE}",parse_mode=ParseMode.MARKDOWN,reply_markup=menu())
-    elif d=="location": await q.edit_message_text(f"📍 *Our Location*\n\n{ADDRESS}",parse_mode=ParseMode.MARKDOWN,reply_markup=menu())
+    starter = [
+        (
+            "royal_blue_hijab",
+            "Royal Blue Hijab",
+            "hijabs",
+            None,
+            "Elegant royal blue hijab. Price on request.",
+        ),
+        (
+            "ismat_jilbab",
+            "Ismat Jilbab",
+            "jilbabs",
+            24000,
+            "Free-size maxi jilbab. Elegant, comfortable and modest.",
+        ),
+    ]
 
-async def show_cart(u,ct):
-    cart=ct.user_data.get("cart",{})
-    if not cart:
-        text="🛒 *Your cart is empty.*"; kb=menu()
+    for product in starter:
+        c.execute(
+            """
+            INSERT OR IGNORE INTO products
+            (id, name, category, price, description)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            product,
+        )
+
+    c.commit()
+    c.close()
+
+
+def money(value):
+    if value is None:
+        return "Price on request"
+    return f"₦{value:,.0f}"
+
+
+def get_products(category=None):
+    c = conn()
+    if category:
+        rows = c.execute(
+            """
+            SELECT * FROM products
+            WHERE active=1 AND category=?
+            ORDER BY name
+            """,
+            (category,),
+        ).fetchall()
     else:
-        lines=["🛒 *Your Cart*\n"]; total=0; unknown=False
-        for pid,qty in cart.items():
-            p=get_product(pid)
-            if not p: continue
-            if p["price"] is None: unknown=True; sub="Price on request"
-            else: sub=f"₦{p['price']*qty:,.0f}"; total+=p["price"]*qty
-            lines.append(f"• {p['name']} × {qty} — {sub}")
-        lines.append(f"\n*Total: {'Price on request' if unknown else f'₦{total:,.0f}'}*")
-        text="\n".join(lines); kb=InlineKeyboardMarkup([[InlineKeyboardButton("📦 Checkout",callback_data="checkout")],[InlineKeyboardButton("🗑️ Clear Cart",callback_data="clear")],[InlineKeyboardButton("🛍️ Continue Shopping",callback_data="shop")]])
-    if u.callback_query: await u.callback_query.edit_message_text(text,parse_mode=ParseMode.MARKDOWN,reply_markup=kb)
-    else: await u.message.reply_text(text,parse_mode=ParseMode.MARKDOWN,reply_markup=kb)
+        rows = c.execute(
+            """
+            SELECT * FROM products
+            WHERE active=1
+            ORDER BY name
+            """
+        ).fetchall()
+    c.close()
+    return rows
 
-async def checkout(u,ct):
-    cart=ct.user_data.get("cart",{})
+
+def get_product(product_id):
+    c = conn()
+    row = c.execute(
+        "SELECT * FROM products WHERE id=?",
+        (product_id,),
+    ).fetchone()
+    c.close()
+    return row
+
+
+# -------------------- HELPERS --------------------
+
+def is_admin(update):
+    user = update.effective_user
+    return bool(user and user.id == ADMIN_ID)
+
+
+def main_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛍️ Shop Products", callback_data="shop")],
+        [
+            InlineKeyboardButton("🧕 Hijabs", callback_data="cat:hijabs"),
+            InlineKeyboardButton("👗 Jilbabs", callback_data="cat:jilbabs"),
+        ],
+        [
+            InlineKeyboardButton("🧵 Textiles", callback_data="cat:textiles"),
+            InlineKeyboardButton("✨ More", callback_data="cat:more"),
+        ],
+        [
+            InlineKeyboardButton("🛒 My Cart", callback_data="cart"),
+            InlineKeyboardButton("📦 My Orders", callback_data="orders"),
+        ],
+        [
+            InlineKeyboardButton("📞 Contact Us", callback_data="contact"),
+            InlineKeyboardButton("📍 Location", callback_data="location"),
+        ],
+        [InlineKeyboardButton("🌐 Visit Website", url=WEBSITE)],
+    ])
+
+
+def back_menu(callback_data="home"):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Back", callback_data=callback_data)],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="home")],
+    ])
+
+
+def category_menu(category):
+    rows = get_products(category)
+    buttons = []
+
+    for product in rows:
+        buttons.append([
+            InlineKeyboardButton(
+                f"{product['name']} — {money(product['price'])}",
+                callback_data=f"product:{product['id']}",
+            )
+        ])
+
+    if not rows:
+        buttons.append([
+            InlineKeyboardButton(
+                "No products available yet",
+                callback_data="shop",
+            )
+        ])
+
+    buttons.append([
+        InlineKeyboardButton("🏠 Main Menu", callback_data="home")
+    ])
+
+    return InlineKeyboardMarkup(buttons)
+
+
+def cart_total(cart):
+    total = 0
+    unknown = False
+
+    for product_id, quantity in cart.items():
+        product = get_product(product_id)
+        if not product:
+            continue
+
+        if product["price"] is None:
+            unknown = True
+        else:
+            total += product["price"] * quantity
+
+    return None if unknown else total
+
+
+def cart_lines(cart):
+    lines = []
+    total = 0
+    unknown = False
+
+    for product_id, quantity in cart.items():
+        product = get_product(product_id)
+        if not product:
+            continue
+
+        if product["price"] is None:
+            subtotal = "Price on request"
+            unknown = True
+        else:
+            subtotal_value = product["price"] * quantity
+            subtotal = money(subtotal_value)
+            total += subtotal_value
+
+        lines.append(
+            f"• {product['name']} × {quantity} — {subtotal}"
+        )
+
+    return lines, (None if unknown else total)
+
+
+def clear_checkout_data(context):
+    for key in [
+        "checkout",
+        "cart",
+        "customer_name",
+        "phone",
+        "address",
+        "pending_order",
+    ]:
+        context.user_data.pop(key, None)
+
+
+# -------------------- USER COMMANDS --------------------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        f"🖤 *{NAME}*\n\n"
+        f"*{TAGLINE}*\n\n"
+        "Welcome! Discover beautiful hijabs, jilbabs, "
+        "textiles and more.\n\n"
+        "Choose an option:"
+    )
+
+    if update.message:
+        await update.message.reply_text(
+            text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_menu(),
+        )
+
+
+async def shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    target = update.message or update.effective_message
+    await target.reply_text(
+        "🛍️ *Choose a collection:*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu(),
+    )
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "❓ *Help*\n\n"
+        "Use /start to open the shop.\n"
+        "Use /shop to browse products.\n"
+        "Use /cart to view your cart.\n"
+        "Use /orders to view your orders.\n"
+        "Use /contact for contact details.\n\n"
+        "To cancel an active checkout, send *cancel*.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_cart(update, context)
+
+
+async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    c = conn()
+    rows = c.execute(
+        """
+        SELECT * FROM orders
+        WHERE user_id=?
+        ORDER BY id DESC
+        LIMIT 10
+        """,
+        (user_id,),
+    ).fetchall()
+    c.close()
+
+    if not rows:
+        text = "📦 *You have no orders yet.*"
+    else:
+        text = "📦 *Your recent orders*\n\n"
+        text += "\n".join(
+            f"#{row['id']} — {money(row['total'])} — {row['status']}"
+            for row in rows
+        )
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_menu(),
+        )
+    else:
+        await update.message.reply_text(
+            text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_menu(),
+        )
+
+
+async def contact_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        f"📞 *{NAME}*\n\n"
+        f"{PHONE1}\n"
+        f"{PHONE2}\n\n"
+        f"WhatsApp: https://wa.me/{WHATSAPP}\n"
+        f"Website: {WEBSITE}",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu(),
+    )
+
+
+# -------------------- CART --------------------
+
+async def show_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cart = context.user_data.get("cart", {})
+
     if not cart:
-        return await (u.callback_query.edit_message_text("Your cart is empty.",reply_markup=menu()) if u.callback_query else u.message.reply_text("Your cart is empty.",reply_markup=menu()))
-    total=0; unknown=False; items=[]
-    for pid,qty in cart.items():
-        p=get_product(pid)
-        if p:
-            items.append(f"{p['name']} × {qty}")
-            if p["price"] is None: unknown=True
-            else: total+=p["price"]*qty
-    ct.user_data["items"]="\n".join(items); ct.user_data["total"]=None if unknown else total; ct.user_data["state"]="phone"
-    await u.effective_message.reply_text("📦 *Checkout*\n\nPlease share your phone number.",parse_mode=ParseMode.MARKDOWN,reply_markup=ReplyKeyboardMarkup([[KeyboardButton("📱 Share Phone Number",request_contact=True)]],resize_keyboard=True,one_time_keyboard=True))
+        text = "🛒 *Your cart is empty.*"
+        keyboard = main_menu()
+    else:
+        lines, total = cart_lines(cart)
 
-async def text_handler(u,ct):
-    state=ct.user_data.get("state")
-    if state=="phone":
-        ct.user_data["phone"]=u.message.contact.phone_number if u.message.contact else u.message.text
-        ct.user_data["state"]="address"
-        await u.message.reply_text("📍 Now send your delivery address.")
-    elif state=="address":
-        if u.message.text.lower()=="cancel": ct.user_data.clear(); return await u.message.reply_text("Checkout cancelled.",reply_markup=menu())
-        await create_order(u,ct,u.message.text)
-    elif admin(u):
-        await u.message.reply_text("Admin: /admin_products /addproduct /setphoto /deleteproduct /admin_orders")
+        text = "🛒 *Your Cart*\n\n"
+        text += "\n".join(lines)
+        text += "\n\n"
+        text += f"*Total: {money(total)}*"
 
-async def create_order(u,ct,address):
-    uid=u.effective_user.id; username=u.effective_user.username or ""; name=u.effective_user.full_name
-    total=ct.user_data.get("total"); items=ct.user_data.get("items"); phone=ct.user_data.get("phone","")
-    c=conn(); cur=c.execute("INSERT INTO orders(user_id,username,customer_name,phone,address,items,total) VALUES(?,?,?,?,?,?,?)",(uid,username,name,phone,address,items,total or 0)); oid=cur.lastrowid; c.commit(); c.close()
-    await ct.bot.send_message(ADMIN_ID,f"🔔 *NEW ORDER #{oid}*\n\nCustomer: {name}\nUsername: @{username or 'none'}\nTelegram ID: `{uid}`\nPhone: {phone}\nAddress: {address}\n\nItems:\n{items}\n\nTotal: {money(total)}",parse_mode=ParseMode.MARKDOWN)
-    ct.user_data.clear()
-    await u.message.reply_text(f"✅ *Order #{oid} received!*\n\nThank you for shopping with AD Fashion Hijabs & More.\nWe will contact you to confirm the order.",parse_mode=ParseMode.MARKDOWN,reply_markup=menu())
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🧾 Checkout", callback_data="checkout")],
+            [InlineKeyboardButton("🗑️ Clear Cart", callback_data="clear")],
+            [InlineKeyboardButton("🛍️ Continue Shopping", callback_data="shop")],
+        ])
 
-async def admin_products(u,ct):
-    if not admin(u): return
-    rows=get_products(); await u.message.reply_text("🛠️ Products\n\n"+"\n".join(f"{r['id']} | {r['name']} | {r['category']} | {money(r['price'])}" for r in rows) or "No products.")
-async def addproduct(u,ct):
-    if not admin(u): return
-    parts=[x.strip() for x in u.message.text.partition(" ")[2].split("|")]
-    if len(parts)<5: return await u.message.reply_text("Format: /addproduct ID | Name | Category | Price | Description\nUse 0 for price-on-request.")
-    pid,name,cat,price,desc=parts[:5]; pv=None if price=="0" else int(price.replace(",","").replace("₦",""))
-    c=conn(); c.execute("INSERT OR REPLACE INTO products(id,name,category,price,description,active) VALUES(?,?,?,?,?,1)",(pid,name,cat.lower(),pv,desc)); c.commit(); c.close()
-    await u.message.reply_text(f"✅ Saved {name}")
-async def deleteproduct(u,ct):
-    if not admin(u): return
-    pid=u.message.text.partition(" ")[2].strip(); c=conn(); c.execute("UPDATE products SET active=0 WHERE id=?",(pid,)); c.commit(); c.close(); await u.message.reply_text("✅ Product removed.")
-async def setphoto(u,ct):
-    if not admin(u): return
-    pid=u.message.text.partition(" ")[2].strip()
-    if not pid: return await u.message.reply_text("Use /setphoto PRODUCT_ID")
-    ct.user_data["photo_target"]=pid; await u.message.reply_text("Now send the product photo.")
-async def photo(u,ct):
-    if not admin(u): return
-    pid=ct.user_data.get("photo_target")
-    if not pid: return await u.message.reply_text("Use /setphoto PRODUCT_ID first.")
-    fid=u.message.photo[-1].file_id; c=conn(); c.execute("UPDATE products SET photo_file_id=? WHERE id=?",(fid,pid)); c.commit(); c.close(); ct.user_data.pop("photo_target",None); await u.message.reply_text("✅ Photo saved.")
-async def admin_orders(u,ct):
-    if not admin(u): return
-    c=conn(); rows=c.execute("SELECT * FROM orders ORDER BY id DESC LIMIT 20").fetchall(); c.close()
-    if not rows: return await u.message.reply_text("No orders yet.")
-    for r in rows: await u.message.reply_text(f"📦 Order #{r['id']}\nCustomer: {r['customer_name']}\nPhone: {r['phone']}\nAddress: {r['address']}\nItems: {r['items']}\nTotal: {money(r['total'])}\nStatus: {r['status']}")
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=keyboard,
+        )
+    else:
+        await update.effective_message.reply_text(
+            text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=keyboard,
+        )
 
-app_flask=Flask(__name__)
+
+# -------------------- CHECKOUT PHASE 2 --------------------
+
+async def checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cart = context.user_data.get("cart", {})
+
+    if not cart:
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                "🛒 Your cart is empty.",
+                reply_markup=main_menu(),
+            )
+        else:
+            await update.effective_message.reply_text(
+                "🛒 Your cart is empty.",
+                reply_markup=main_menu(),
+            )
+        return
+
+    context.user_data["checkout"] = "phone"
+
+    await update.effective_message.reply_text(
+        "🧾 *Checkout — Step 1 of 3*\n\n"
+        "Please share your phone number with us.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=ReplyKeyboardMarkup(
+            [[
+                KeyboardButton(
+                    "📱 Share Phone Number",
+                    request_contact=True,
+                )
+            ]],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        ),
+    )
+
+
+async def ask_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["checkout"] = "address"
+
+    await update.message.reply_text(
+        "📍 *Checkout — Step 2 of 3*\n\n"
+        "Now send your complete delivery address.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+async def show_order_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cart = context.user_data.get("cart", {})
+    phone = context.user_data.get("phone", "")
+    address = context.user_data.get("address", "")
+    name = update.effective_user.full_name
+
+    lines, total = cart_lines(cart)
+
+    context.user_data["customer_name"] = name
+    context.user_data["pending_order"] = True
+
+    text = (
+        "🧾 *Checkout — Step 3 of 3*\n\n"
+        "*Please confirm your order:*\n\n"
+        f"👤 Customer: {name}\n"
+        f"📞 Phone: {phone}\n"
+        f"📍 Address: {address}\n\n"
+        "*Items:*\n"
+        + "\n".join(lines)
+        + f"\n\n💰 *Total: {money(total)}*"
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "✅ Confirm Order",
+                callback_data="confirm_order",
+            ),
+            InlineKeyboardButton(
+                "❌ Cancel",
+                callback_data="cancel_order",
+            ),
+        ],
+        [InlineKeyboardButton("🛒 Back to Cart", callback_data="cart")],
+    ])
+
+    await update.message.reply_text(
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=keyboard,
+    )
+
+
+async def create_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cart = context.user_data.get("cart", {})
+
+    if not cart:
+        await update.effective_message.reply_text(
+            "🛒 Your cart is empty.",
+            reply_markup=main_menu(),
+        )
+        return
+
+    user = update.effective_user
+    username = user.username or ""
+    customer_name = context.user_data.get(
+        "customer_name",
+        user.full_name,
+    )
+    phone = context.user_data.get("phone", "")
+    address = context.user_data.get("address", "")
+
+    lines, total = cart_lines(cart)
+    items = "\n".join(lines)
+
+    c = conn()
+
+    cursor = c.execute(
+        """
+        INSERT INTO orders
+        (user_id, username, customer_name, phone, address, items, total, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user.id,
+            username,
+            customer_name,
+            phone,
+            address,
+            items,
+            total or 0,
+            "PENDING",
+        ),
+    )
+
+    order_id = cursor.lastrowid
+    c.commit()
+    c.close()
+
+    order_number = f"AD-{order_id:05d}"
+
+    admin_text = (
+        f"🔔 *NEW ORDER #{order_number}*\n\n"
+        f"👤 Customer: {customer_name}\n"
+        f"Username: @{username or 'none'}\n"
+        f"Telegram ID: `{user.id}`\n"
+        f"📞 Phone: {phone}\n"
+        f"📍 Address: {address}\n\n"
+        f"*Items:*\n{items}\n\n"
+        f"💰 *Total: {money(total)}*\n"
+        f"📦 Status: *PENDING*"
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=admin_text,
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception:
+        logger.exception("Could not send admin order notification.")
+
+    clear_checkout_data(context)
+
+    await update.effective_message.reply_text(
+        f"✅ *Order #{order_number} received!*\n\n"
+        "Thank you for shopping with AD Fashion Hijabs & More. "
+        "We have received your order and will contact you to confirm it.\n\n"
+        "📦 Status: *PENDING*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu(),
+    )
+
+
+# -------------------- TEXT / CONTACT HANDLER --------------------
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message:
+        return
+
+    text = (message.text or "").strip()
+    lower = text.lower()
+
+    if lower == "cancel":
+        context.user_data.clear()
+        await message.reply_text(
+            "❌ Checkout cancelled.",
+            reply_markup=main_menu(),
+        )
+        return
+
+    state = context.user_data.get("checkout")
+
+    if state == "phone":
+        if message.contact:
+            context.user_data["phone"] = message.contact.phone_number
+        else:
+            context.user_data["phone"] = text
+
+        await ask_address(update, context)
+        return
+
+    if state == "address":
+        if not text:
+            await message.reply_text("Please send a valid delivery address.")
+            return
+
+        context.user_data["address"] = text
+        await show_order_confirmation(update, context)
+        return
+
+    if is_admin(update):
+        await message.reply_text(
+            "👨‍💼 *Admin commands:*\n\n"
+            "/admin_products\n"
+            "/addproduct ID | Name | Category | Price | Description\n"
+            "/setphoto PRODUCT_ID\n"
+            "/deleteproduct PRODUCT_ID\n"
+            "/admin_orders\n"
+            "/status ORDER_ID STATUS",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+# -------------------- BUTTONS --------------------
+
+async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+
+    if data == "home":
+        await query.edit_message_text(
+            f"🖤 *{NAME}*\n\n"
+            f"*{TAGLINE}*\n\n"
+            "Choose an option:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_menu(),
+        )
+
+    elif data == "shop":
+        await query.edit_message_text(
+            "🛍️ *Choose a collection:*",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_menu(),
+        )
+
+    elif data.startswith("cat:"):
+        category = data.split(":", 1)[1]
+        labels = {
+            "hijabs": "🧕 Hijabs",
+            "jilbabs": "👗 Jilbabs",
+            "textiles": "🧵 Textiles",
+            "more": "✨ More",
+        }
+
+        await query.edit_message_text(
+            f"*{labels.get(category, category)}*\n\n"
+            "Select a product:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=category_menu(category),
+        )
+
+    elif data.startswith("product:"):
+        product_id = data.split(":", 1)[1]
+        product = get_product(product_id)
+
+        if not product:
+            await query.edit_message_text(
+                "Product not found.",
+                reply_markup=main_menu(),
+            )
+            return
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "🛒 Add to Cart",
+                    callback_data=f"add:{product['id']}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⚡ Order Now",
+                    callback_data=f"add:{product['id']}:now",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬅️ Back",
+                    callback_data=f"cat:{product['category']}",
+                )
+            ],
+        ])
+
+        text = (
+            f"*{product['name']}*\n\n"
+            f"{product['description']}\n\n"
+            f"💰 *{money(product['price'])}*"
+        )
+
+        if product["photo_file_id"]:
+            await query.message.reply_photo(
+                photo=product["photo_file_id"],
+                caption=text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=keyboard,
+            )
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+        else:
+            await query.edit_message_text(
+                text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=keyboard,
+            )
+
+    elif data.startswith("add:"):
+        parts = data.split(":")
+        product_id = parts[1]
+        order_now = len(parts) > 2 and parts[2] == "now"
+
+        context.user_data.setdefault("cart", {})
+        cart = context.user_data["cart"]
+        cart[product_id] = cart.get(product_id, 0) + 1
+
+        if order_now:
+            await checkout(update, context)
+        else:
+            await query.edit_message_text(
+                "✅ *Added to your cart.*",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "🛒 View Cart",
+                            callback_data="cart",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "🛍️ Continue Shopping",
+                            callback_data="shop",
+                        )
+                    ],
+                ]),
+            )
+
+    elif data == "cart":
+        await show_cart(update, context)
+
+    elif data == "checkout":
+        await checkout(update, context)
+
+    elif data == "clear":
+        context.user_data["cart"] = {}
+        await query.edit_message_text(
+            "🛒 Your cart is empty.",
+            reply_markup=main_menu(),
+        )
+
+    elif data == "confirm_order":
+        await create_order(update, context)
+
+    elif data == "cancel_order":
+        context.user_data.clear()
+        await query.edit_message_text(
+            "❌ *Order cancelled.*\n\n"
+            "Your cart has been cleared.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_menu(),
+        )
+
+    elif data == "orders":
+        await orders_cmd(update, context)
+
+    elif data == "contact":
+        await query.edit_message_text(
+            f"📞 *{NAME}*\n\n"
+            f"{PHONE1}\n"
+            f"{PHONE2}\n\n"
+            f"WhatsApp: https://wa.me/{WHATSAPP}\n"
+            f"Website: {WEBSITE}",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_menu(),
+        )
+
+    elif data == "location":
+        await query.edit_message_text(
+            f"📍 *Our Location*\n\n{ADDRESS}",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_menu(),
+        )
+
+
+# -------------------- ADMIN --------------------
+
+async def admin_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+
+    rows = get_products()
+
+    if not rows:
+        await update.message.reply_text("No products.")
+        return
+
+    text = "🛠️ *Products*\n\n"
+
+    for row in rows:
+        text += (
+            f"`{row['id']}` | {row['name']} | "
+            f"{row['category']} | {money(row['price'])}\n"
+        )
+
+    await update.message.reply_text(
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def addproduct(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+
+    raw = update.message.text.partition(" ")[2]
+    parts = [x.strip() for x in raw.split("|")]
+
+    if len(parts) < 5:
+        await update.message.reply_text(
+            "Format:\n"
+            "/addproduct ID | Name | Category | Price | Description\n\n"
+            "Use 0 for price-on-request."
+        )
+        return
+
+    product_id, name, category, price, description = parts[:5]
+
+    try:
+        price_value = (
+            None
+            if price == "0"
+            else int(
+                price.replace(",", "")
+                .replace("₦", "")
+                .strip()
+            )
+        )
+    except ValueError:
+        await update.message.reply_text(
+            "Invalid price. Enter a number, e.g. 24000, or 0."
+        )
+        return
+
+    c = conn()
+    c.execute(
+        """
+        INSERT OR REPLACE INTO products
+        (id, name, category, price, description, active)
+        VALUES (?, ?, ?, ?, ?, 1)
+        """,
+        (
+            product_id,
+            name,
+            category.lower(),
+            price_value,
+            description,
+        ),
+    )
+    c.commit()
+    c.close()
+
+    await update.message.reply_text(
+        f"✅ Saved: {name}"
+    )
+
+
+async def deleteproduct(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+
+    product_id = update.message.text.partition(" ")[2].strip()
+
+    if not product_id:
+        await update.message.reply_text(
+            "Use: /deleteproduct PRODUCT_ID"
+        )
+        return
+
+    c = conn()
+    c.execute(
+        "UPDATE products SET active=0 WHERE id=?",
+        (product_id,),
+    )
+    c.commit()
+    c.close()
+
+    await update.message.reply_text(
+        "✅ Product removed from the shop."
+    )
+
+
+async def setphoto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+
+    product_id = update.message.text.partition(" ")[2].strip()
+
+    if not product_id:
+        await update.message.reply_text(
+            "Use: /setphoto PRODUCT_ID"
+        )
+        return
+
+    if not get_product(product_id):
+        await update.message.reply_text(
+            "Product ID not found."
+        )
+        return
+
+    context.user_data["photo_target"] = product_id
+
+    await update.message.reply_text(
+        f"📸 Now send the photo for `{product_id}`.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+
+    product_id = context.user_data.get("photo_target")
+
+    if not product_id:
+        await update.message.reply_text(
+            "Use /setphoto PRODUCT_ID first."
+        )
+        return
+
+    file_id = update.message.photo[-1].file_id
+
+    c = conn()
+    c.execute(
+        "UPDATE products SET photo_file_id=? WHERE id=?",
+        (file_id, product_id),
+    )
+    c.commit()
+    c.close()
+
+    context.user_data.pop("photo_target", None)
+
+    await update.message.reply_text(
+        "✅ Product photo saved."
+    )
+
+
+async def admin_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+
+    c = conn()
+    rows = c.execute(
+        "SELECT * FROM orders ORDER BY id DESC LIMIT 20"
+    ).fetchall()
+    c.close()
+
+    if not rows:
+        await update.message.reply_text("No orders yet.")
+        return
+
+    for row in rows:
+        order_number = f"AD-{row['id']:05d}"
+
+        text = (
+            f"📦 *Order #{order_number}*\n"
+            f"Customer: {row['customer_name']}\n"
+            f"Phone: {row['phone']}\n"
+            f"Address: {row['address']}\n\n"
+            f"Items:\n{row['items']}\n\n"
+            f"Total: {money(row['total'])}\n"
+            f"Status: *{row['status']}*\n"
+            f"Created: {row['created_at']}"
+        )
+
+        await update.message.reply_text(
+            text,
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+
+    raw = update.message.text.partition(" ")[2].strip()
+    parts = raw.split(maxsplit=1)
+
+    if len(parts) != 2:
+        await update.message.reply_text(
+            "Format:\n/status ORDER_ID STATUS\n\n"
+            "Example:\n/status 1 PAID"
+        )
+        return
+
+    try:
+        order_id = int(parts[0])
+    except ValueError:
+        await update.message.reply_text("Invalid order ID.")
+        return
+
+    new_status = parts[1].strip().upper()
+
+    allowed = {
+        "PENDING",
+        "AWAITING_PAYMENT",
+        "PAID",
+        "PROCESSING",
+        "OUT_FOR_DELIVERY",
+        "DELIVERED",
+        "CANCELLED",
+    }
+
+    if new_status not in allowed:
+        await update.message.reply_text(
+            "Allowed statuses:\n"
+            "PENDING\n"
+            "AWAITING_PAYMENT\n"
+            "PAID\n"
+            "PROCESSING\n"
+            "OUT_FOR_DELIVERY\n"
+            "DELIVERED\n"
+            "CANCELLED"
+        )
+        return
+
+    c = conn()
+    row = c.execute(
+        "SELECT * FROM orders WHERE id=?",
+        (order_id,),
+    ).fetchone()
+
+    if not row:
+        c.close()
+        await update.message.reply_text("Order not found.")
+        return
+
+    c.execute(
+        "UPDATE orders SET status=? WHERE id=?",
+        (new_status, order_id),
+    )
+    c.commit()
+    c.close()
+
+    order_number = f"AD-{order_id:05d}"
+
+    # Notify the customer about the status change.
+    try:
+        await context.bot.send_message(
+            chat_id=row["user_id"],
+            text=(
+                f"📦 *Order #{order_number} Update*\n\n"
+                f"Your order status is now:\n"
+                f"*{new_status.replace('_', ' ')}*"
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception:
+        logger.exception("Could not notify customer about status change.")
+
+    await update.message.reply_text(
+        f"✅ Order #{order_number} updated to *{new_status}*.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+# -------------------- HEALTH SERVER --------------------
+
+app_flask = Flask(__name__)
+
+
 @app_flask.get("/")
-def health(): return {"status":"ok","service":NAME}
-def health_server(): app_flask.run(host="0.0.0.0",port=PORT,use_reloader=False)
+def health():
+    return {
+        "status": "ok",
+        "service": NAME,
+        "phase": "2",
+    }
+
+
+def health_server():
+    app_flask.run(
+        host="0.0.0.0",
+        port=PORT,
+        use_reloader=False,
+    )
+
+
+# -------------------- MAIN --------------------
 
 async def main():
-    init_db(); Thread(target=health_server,daemon=True).start()
-    app=Application.builder().token(BOT_TOKEN).build()
-    for cmd,fn in [("start",start),("help",help_cmd),("shop",shop),("cart",cart_cmd),("orders",orders_cmd),("contact",contact_cmd),("admin_products",admin_products),("addproduct",addproduct),("deleteproduct",deleteproduct),("setphoto",setphoto),("admin_orders",admin_orders)]:
-        app.add_handler(CommandHandler(cmd,fn))
-    app.add_handler(CallbackQueryHandler(buttons))
-    app.add_handler(MessageHandler(filters.PHOTO,photo))
-    app.add_handler(MessageHandler(filters.CONTACT | (filters.TEXT & ~filters.COMMAND),text_handler))
-    await app.initialize(); await app.start(); await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    init_db()
+
+    Thread(
+        target=health_server,
+        daemon=True,
+    ).start()
+
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    commands = [
+        ("start", start),
+        ("help", help_cmd),
+        ("shop", shop),
+        ("cart", cart_cmd),
+        ("orders", orders_cmd),
+        ("contact", contact_cmd),
+        ("admin_products", admin_products),
+        ("addproduct", addproduct),
+        ("deleteproduct", deleteproduct),
+        ("setphoto", setphoto),
+        ("admin_orders", admin_orders),
+        ("status", status_command),
+    ]
+
+    for command, handler in commands:
+        app.add_handler(
+            CommandHandler(command, handler)
+        )
+
+    app.add_handler(
+        CallbackQueryHandler(buttons)
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.PHOTO,
+            photo,
+        )
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.CONTACT | (filters.TEXT & ~filters.COMMAND),
+            text_handler,
+        )
+    )
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
+
+    logger.info("AD Fashion Hijabs & More bot is running.")
+
     await asyncio.Event().wait()
-if __name__=="__main__": asyncio.run(main())
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
