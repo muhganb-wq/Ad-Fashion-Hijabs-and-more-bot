@@ -160,6 +160,15 @@ def money(value):
     return f"₦{value:,.0f}"
 
 
+def fmt_status(status):
+    """Renders a status code for display inside Markdown-formatted text.
+    Telegram's legacy Markdown treats a bare underscore as an italics
+    marker, so AWAITING_PAYMENT / OUT_FOR_DELIVERY etc. would otherwise
+    break message parsing. Replace underscores with spaces for display.
+    """
+    return (status or "").replace("_", " ")
+
+
 def get_products(category=None):
     c = conn()
     if category:
@@ -397,24 +406,27 @@ async def payment_done(update: Update, context: ContextTypes.DEFAULT_TYPE, order
     try:
         order_id = int(order_id_text)
     except ValueError:
-        await query.answer("Invalid order number.", show_alert=True)
+        await query.edit_message_text("⚠️ Invalid order number.", reply_markup=main_menu())
         return
 
     c = conn()
     row = c.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
     if not row:
         c.close()
-        await query.answer("Order not found.", show_alert=True)
+        await query.edit_message_text("⚠️ Order not found.", reply_markup=main_menu())
         return
 
     if row["user_id"] != update.effective_user.id:
         c.close()
-        await query.answer("This order does not belong to you.", show_alert=True)
+        await query.edit_message_text("⚠️ This order does not belong to you.", reply_markup=main_menu())
         return
 
     if row["payment_notified"]:
         c.close()
-        await query.answer("We already received your payment notification.", show_alert=True)
+        await query.edit_message_text(
+            "✅ We already received your payment notification.",
+            reply_markup=main_menu(),
+        )
         return
 
     c.execute("UPDATE orders SET payment_notified=1, payment_method=? WHERE id=?", ("CUSTOMER_PAYMENT_NOTIFICATION", order_id))
@@ -430,7 +442,7 @@ async def payment_done(update: Update, context: ContextTypes.DEFAULT_TYPE, order
         f"Telegram ID: `{row['user_id']}`\n"
         f"📞 Phone: {row['phone']}\n"
         f"💰 Order Total: *{money(row['total'])}*\n"
-        f"📦 Current Status: *{row['status']}*\n\n"
+        f"📦 Current Status: *{fmt_status(row['status'])}*\n\n"
         "⚠️ Customer says payment has been made. Please verify the bank transaction before marking the order as PAID."
     )
     try:
@@ -478,7 +490,7 @@ async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         text = "📦 *Your recent orders*\n\n"
         text += "\n".join(
-            f"#{row['id']} — {money(row['total'])} — {row['status']}"
+            f"#{row['id']} — {money(row['total'])} — {fmt_status(row['status'])}"
             for row in rows
         )
 
@@ -1139,7 +1151,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("delivery:"):
         method = data.split(":", 1)[1]
         if method not in DELIVERY_LABELS:
-            await query.answer("Unknown delivery method.", show_alert=True)
+            await query.edit_message_text("⚠️ Unknown delivery method.", reply_markup=main_menu())
             return
         await query.edit_message_text(
             f"🚚 *{DELIVERY_LABELS[method]}* selected.",
@@ -1170,7 +1182,6 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("adm:"):
         if not is_admin(update):
-            await query.answer("Admins only.", show_alert=True)
             return
         await handle_admin_callback(update, context, data)
 
@@ -1423,7 +1434,7 @@ async def admin_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{delivery_line}\n\n"
             f"Items:\n{row['items']}\n\n"
             f"Total: {money(row['total'])}\n"
-            f"Status: *{row['status']}*\n"
+            f"Status: *{fmt_status(row['status'])}*\n"
             f"{payment_line}\n"
             f"Created: {row['created_at']}"
         )
@@ -1528,7 +1539,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     order_number = f"AD-{order_id:05d}"
 
     await update.message.reply_text(
-        f"✅ Order #{order_number} updated to *{new_status}*.",
+        f"✅ Order #{order_number} updated to *{fmt_status(new_status)}*.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -1614,7 +1625,7 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
         product_id = data.split(":", 2)[2]
         product = get_product(product_id)
         if not product:
-            await query.answer("Product not found.", show_alert=True)
+            await query.edit_message_text("⚠️ Product not found.", reply_markup=admin_back_button())
             return
         text = (
             f"*{product['name']}*\n"
@@ -1645,7 +1656,7 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if data == "adm:editproduct":
         rows = get_products()
         if not rows:
-            await query.answer("No products to edit.", show_alert=True)
+            await query.edit_message_text("No products to edit yet.", reply_markup=admin_back_button())
             return
         buttons = [
             [InlineKeyboardButton(row["name"], callback_data=f"adm:editp:{row['id']}")]
@@ -1663,7 +1674,7 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
         product_id = data.split(":", 2)[2]
         product = get_product(product_id)
         if not product:
-            await query.answer("Product not found.", show_alert=True)
+            await query.edit_message_text("⚠️ Product not found.", reply_markup=admin_back_button())
             return
         buttons = [
             [InlineKeyboardButton("Name", callback_data=f"adm:editf:{product_id}:name")],
@@ -1683,7 +1694,7 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
         _, _, product_id, field = data.split(":", 3)
         product = get_product(product_id)
         if not product:
-            await query.answer("Product not found.", show_alert=True)
+            await query.edit_message_text("⚠️ Product not found.", reply_markup=admin_back_button())
             return
         context.user_data["admin_edit"] = {"id": product_id, "field": field}
         hint = " (use 0 for price-on-request)" if field == "price" else ""
@@ -1697,7 +1708,7 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if data == "adm:deleteproduct":
         rows = get_products()
         if not rows:
-            await query.answer("No products to delete.", show_alert=True)
+            await query.edit_message_text("No products to delete yet.", reply_markup=admin_back_button())
             return
         buttons = [
             [InlineKeyboardButton(f"🗑️ {row['name']}", callback_data=f"adm:delp:{row['id']}")]
@@ -1715,7 +1726,7 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
         product_id = data.split(":", 2)[2]
         product = get_product(product_id)
         if not product:
-            await query.answer("Product not found.", show_alert=True)
+            await query.edit_message_text("⚠️ Product not found.", reply_markup=admin_back_button())
             return
         await query.edit_message_text(
             f"⚠️ Remove *{product['name']}* from the shop?",
@@ -1756,7 +1767,7 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 order_number = f"AD-{row['id']:05d}"
                 lines.append(
                     f"#{order_number} — {row['customer_name']} — "
-                    f"{money(row['total'])} — *{row['status']}*"
+                    f"{money(row['total'])} — *{fmt_status(row['status'])}*"
                 )
             lines.append("\nUse /admin_orders for full details, or /status ID STATUS to update.")
             text = "\n".join(lines)
@@ -1800,7 +1811,7 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
             "*By status:*",
         ]
         for row in status_rows:
-            lines.append(f"• {row['status']}: {row['n']}")
+            lines.append(f"• {fmt_status(row['status'])}: {row['n']}")
 
         await query.edit_message_text(
             "\n".join(lines),
@@ -1865,15 +1876,14 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
         try:
             order_id = int(order_id_text)
         except ValueError:
-            await query.answer("Invalid order.", show_alert=True)
+            await query.edit_message_text("⚠️ Invalid order.", reply_markup=admin_back_button())
             return
 
         row = await update_order_status(context, order_id, new_status)
         if not row:
-            await query.answer("Order not found.", show_alert=True)
+            await query.edit_message_text("⚠️ Order not found.", reply_markup=admin_back_button())
             return
 
-        await query.answer(f"Order #{order_id:05d} → {new_status}")
         await handle_admin_callback(update, context, "adm:delivery")
         return
 
@@ -1908,7 +1918,7 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await handle_admin_callback(update, context, "adm:settings")
         return
 
-    await query.answer("Unknown admin action.", show_alert=True)
+    await query.edit_message_text("⚠️ Unknown admin action.", reply_markup=admin_back_button())
 
 
 async def handle_admin_add_step(message, context: ContextTypes.DEFAULT_TYPE, admin_add: dict, text: str):
