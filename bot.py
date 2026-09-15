@@ -55,6 +55,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Global Telegram error handler with the real exception traceback."""
+    error = context.error
+    logger.error("UNHANDLED TELEGRAM EXCEPTION: %r", error, exc_info=error)
+    if update is not None:
+        logger.error("Update that caused the exception: %r", update)
+
+
+
 # -------------------- DATABASE --------------------
 
 def conn():
@@ -73,6 +82,8 @@ def init_db():
             category TEXT NOT NULL,
             price INTEGER,
             description TEXT,
+            variety TEXT DEFAULT '',
+            features TEXT DEFAULT '',
             photo_file_id TEXT,
             active INTEGER DEFAULT 1
         )
@@ -95,6 +106,11 @@ def init_db():
 
     # Phase 3 payment fields. Safe for existing databases.
     existing_cols = {row[1] for row in c.execute("PRAGMA table_info(orders)").fetchall()}
+    product_cols = {row[1] for row in c.execute("PRAGMA table_info(products)").fetchall()}
+    if "variety" not in product_cols:
+        c.execute("ALTER TABLE products ADD COLUMN variety TEXT DEFAULT ''")
+    if "features" not in product_cols:
+        c.execute("ALTER TABLE products ADD COLUMN features TEXT DEFAULT ''")
     if "payment_notified" not in existing_cols:
         c.execute("ALTER TABLE orders ADD COLUMN payment_notified INTEGER DEFAULT 0")
     if "payment_method" not in existing_cols:
@@ -1065,11 +1081,13 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ],
         ])
 
-        text = (
-            f"*{product['name']}*\n\n"
-            f"{product['description']}\n\n"
-            f"💰 *{money(product['price'])}*"
-        )
+        details = [f"*{product['name']}*", "", product["description"] or ""]
+        if product["variety"]:
+            details += ["", f"🎨 *Variety:* {product['variety']}"]
+        if product["features"]:
+            details += ["", f"✨ *Features:* {product['features']}"]
+        details += ["", f"💰 *{money(product['price'])}*"]
+        text = "\n".join(details)
 
         if product["photo_file_id"]:
             await query.message.reply_photo(
@@ -1337,6 +1355,26 @@ async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(
             "✅ Product photo saved."
+        )
+        return
+
+    # Admin guided add-product flow: save the uploaded photo as the main/first product image.
+    admin_add = context.user_data.get("admin_add")
+    if is_admin(update) and admin_add and admin_add.get("step") == "photo":
+        data = admin_add["data"]
+        file_id = update.message.photo[-1].file_id
+        c = conn()
+        c.execute(
+            """INSERT OR REPLACE INTO products
+               (id, name, category, price, description, variety, features, photo_file_id, active)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)""",
+            (data["id"], data["name"], data["category"], data["price"], data["description"], data.get("variety", ""), data.get("features", ""), file_id),
+        )
+        c.commit(); c.close()
+        context.user_data.pop("admin_add", None)
+        await update.message.reply_text(
+            f"✅ *{data['name']}* added to the shop.\n📸 Main product photo saved.",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=admin_back_button(),
         )
         return
 
@@ -1631,8 +1669,10 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
             f"*{product['name']}*\n"
             f"ID: `{product['id']}`\n"
             f"Category: {product['category']}\n"
-            f"Price: {money(product['price'])}\n\n"
-            f"{product['description']}"
+            f"Price: {money(product['price'])}\n"
+            f"Variety: {product['variety'] or 'Not specified'}\n"
+            f"Features: {product['features'] or 'Not specified'}\n\n"
+            f"Description: {product['description'] or 'Not specified'}"
         )
         await query.edit_message_text(
             text,
@@ -1646,7 +1686,7 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if data == "adm:addproduct":
         context.user_data["admin_add"] = {"step": "id", "data": {}}
         await query.edit_message_text(
-            "➕ *Add Product — Step 1 of 5*\n\n"
+            "➕ *Add Product — Step 1 of 8*\n\n"
             "Send a short unique ID for the product (e.g. `navy_hijab`).\n\n"
             "Type *cancel* anytime to stop.",
             parse_mode=ParseMode.MARKDOWN,
@@ -1679,14 +1719,32 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
         buttons = [
             [InlineKeyboardButton("Name", callback_data=f"adm:editf:{product_id}:name")],
             [InlineKeyboardButton("Category", callback_data=f"adm:editf:{product_id}:category")],
+            [InlineKeyboardButton("Variety", callback_data=f"adm:editf:{product_id}:variety")],
             [InlineKeyboardButton("Price", callback_data=f"adm:editf:{product_id}:price")],
             [InlineKeyboardButton("Description", callback_data=f"adm:editf:{product_id}:description")],
+            [InlineKeyboardButton("✨ Features", callback_data=f"adm:editf:{product_id}:features")],
+            [InlineKeyboardButton("📸 Main Photo", callback_data=f"adm:editphoto:{product_id}")],
             [InlineKeyboardButton("⬅️ Back", callback_data="adm:editproduct")],
         ]
         await query.edit_message_text(
             f"✏️ *Editing {product['name']}*\n\nWhich field?",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if data.startswith("adm:editphoto:"):
+        product_id = data.split(":", 2)[2]
+        product = get_product(product_id)
+        if not product:
+            await query.edit_message_text("⚠️ Product not found.", reply_markup=admin_back_button())
+            return
+        context.user_data["photo_target"] = product_id
+        await query.edit_message_text(
+            f"📸 Send the new main photo for *{product['name']}*.\n\n"
+            "This replaces the current main/first product image.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Cancel", callback_data=f"adm:editp:{product_id}")]]),
         )
         return
 
@@ -1935,7 +1993,7 @@ async def handle_admin_add_step(message, context: ContextTypes.DEFAULT_TYPE, adm
             return
         data["id"] = product_id
         admin_add["step"] = "name"
-        await message.reply_text("➕ *Step 2 of 5*\n\nSend the product name.", parse_mode=ParseMode.MARKDOWN)
+        await message.reply_text("➕ *Step 2 of 8*\n\nSend the product name.", parse_mode=ParseMode.MARKDOWN)
         return
 
     if step == "name":
@@ -1945,7 +2003,7 @@ async def handle_admin_add_step(message, context: ContextTypes.DEFAULT_TYPE, adm
         data["name"] = text.strip()
         admin_add["step"] = "category"
         await message.reply_text(
-            "➕ *Step 3 of 5*\n\nSend the category (e.g. hijabs, jilbabs, textiles, more).",
+            "➕ *Step 3 of 8*\n\nSend the category (e.g. hijabs, jilbabs, textiles, more).",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -1955,9 +2013,21 @@ async def handle_admin_add_step(message, context: ContextTypes.DEFAULT_TYPE, adm
             await message.reply_text("Please send a valid category.")
             return
         data["category"] = text.strip().lower()
+        admin_add["step"] = "variety"
+        await message.reply_text(
+            "➕ *Step 4 of 8 — Variety*\n\nSend the available variety, such as colors, sizes, materials, styles, or variants.\n\nExample: Royal Blue, Black, Wine | Free Size",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    if step == "variety":
+        if not text.strip():
+            await message.reply_text("Please send the product variety, or type *none* if it has no variants.", parse_mode=ParseMode.MARKDOWN)
+            return
+        data["variety"] = "" if text.strip().lower() == "none" else text.strip()
         admin_add["step"] = "price"
         await message.reply_text(
-            "➕ *Step 4 of 5*\n\nSend the price as a number (e.g. 24000), or 0 for price-on-request.",
+            "➕ *Step 5 of 8 — Price*\n\nSend the price as a number (e.g. 24000), or 0 for price-on-request.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -1973,34 +2043,57 @@ async def handle_admin_add_step(message, context: ContextTypes.DEFAULT_TYPE, adm
         data["price"] = price_value
         admin_add["step"] = "description"
         await message.reply_text(
-            "➕ *Step 5 of 5*\n\nSend a short description.",
+            "➕ *Step 6 of 8*\n\nSend the product description. Include features, material, available varieties/colors/sizes, and important details customers should see.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
     if step == "description":
+        if not text.strip():
+            await message.reply_text("Please send a product description.")
+            return
         data["description"] = text.strip()
+        admin_add["step"] = "features"
+        await message.reply_text(
+            "➕ *Step 7 of 8 — Features*\n\nSend the key product features/benefits.\n\nExample: Lightweight, breathable, soft texture, easy to style, premium finish.\n\nType *none* if you want to skip.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
 
+    if step == "features":
+        data["features"] = "" if text.strip().lower() == "none" else text.strip()
+        admin_add["step"] = "photo"
+        await message.reply_text(
+            "➕ *Step 8 of 8 — Product Photo*\n\n"
+            "Now send the product photo.\n"
+            "📸 This becomes the main/first product image customers see when they open the product.\n\n"
+            "If you want to add it later, type *skip*.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    if step == "photo":
+        if text.lower() != "skip":
+            await message.reply_text(
+                "📸 Please send the product as a photo, or type *skip*.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        data["photo_file_id"] = None
         c = conn()
         c.execute(
-            """
-            INSERT OR REPLACE INTO products
-            (id, name, category, price, description, active)
-            VALUES (?, ?, ?, ?, ?, 1)
-            """,
-            (data["id"], data["name"], data["category"], data["price"], data["description"]),
+            """INSERT OR REPLACE INTO products
+               (id, name, category, price, description, variety, features, photo_file_id, active)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)""",
+            (data["id"], data["name"], data["category"], data["price"], data["description"], data.get("variety", ""), data.get("features", ""), None),
         )
-        c.commit()
-        c.close()
-
+        c.commit(); c.close()
         context.user_data.pop("admin_add", None)
-
         await message.reply_text(
-            f"✅ *{data['name']}* added to the shop.",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=admin_back_button(),
+            f"✅ *{data['name']}* added to the shop.\n📸 No photo added. Use /setphoto {data['id']} later.",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=admin_back_button(),
         )
-
+        return
 
 async def handle_admin_edit_step(message, context: ContextTypes.DEFAULT_TYPE, admin_edit: dict, text: str):
     product_id = admin_edit["id"]
@@ -2099,6 +2192,9 @@ async def main():
             CommandHandler(command, handler)
         )
 
+    # Global error handler: exposes the real exception traceback in Render logs.
+    app.add_error_handler(error_handler)
+
     app.add_handler(
         CallbackQueryHandler(buttons)
     )
@@ -2117,15 +2213,22 @@ async def main():
         )
     )
 
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(
-        allowed_updates=Update.ALL_TYPES
-    )
+    logger.info("Starting AD Fashion Hijabs & More bot...")
+    logger.info("Health server configured on port %s", PORT)
+    logger.info("Starting Telegram polling. Do not call Telegram getUpdates manually while this bot is running.")
 
-    logger.info("AD Fashion Hijabs & More bot is running.")
-
-    await asyncio.Event().wait()
+    try:
+        # Managed lifecycle: initialize, polling, and graceful shutdown are handled together.
+        app.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=False,
+            close_loop=False,
+        )
+    except Exception:
+        logger.exception("FATAL BOT STARTUP/POLLING ERROR")
+        raise
+    finally:
+        logger.info("AD Fashion Hijabs & More bot is shutting down.")
 
 
 if __name__ == "__main__":
