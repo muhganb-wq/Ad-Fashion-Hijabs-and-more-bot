@@ -25,7 +25,7 @@ from telegram.ext import (
 
 # ============================================================
 # AD FASHION HIJABS & MORE — TELEGRAM SHOP BOT
-# PHASES 1–5: Shop, Cart, Checkout, Payment, Delivery, Admin Panel
+# PHASE 6: Professional Operations, Payment Verification, Marketing & Launch
 # ============================================================
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -417,6 +417,106 @@ async def cart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_cart(update, context)
 
 
+async def send_order_status_notification(context, user_id, order_number, status):
+    """Send a consistent customer-facing status notification."""
+    messages = {
+        "PAID": "💳 Payment verified successfully. Your order is now confirmed.",
+        "PROCESSING": "🛠️ Your order is now being prepared.",
+        "OUT_FOR_DELIVERY": "🛵 Your order is on the way to you.",
+        "DELIVERED": "🎉 Your order has been marked as delivered. Thank you for shopping with us!",
+        "CANCELLED": "❌ Your order has been cancelled. Please contact us if you need assistance.",
+        "AWAITING_PAYMENT": "⏳ Your order is waiting for payment.",
+        "PENDING": "📦 Your order is pending review.",
+    }
+    body = messages.get(status, f"📦 Your order status is now: {status.replace('_', ' ')}")
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"📦 *Order #{order_number} Update*\n\n{body}\n\nStatus: *{status.replace('_', ' ')}*",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return True
+    except Exception:
+        logger.exception("Could not notify customer about order status change.")
+        return False
+
+
+async def verify_payment(context, order_id: int, approved: bool):
+    """Admin payment verification. Returns the updated order or None."""
+    c = conn()
+    row = c.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+    if not row:
+        c.close()
+        return None
+
+    if approved:
+        new_status = "PAID"
+        c.execute("UPDATE orders SET status=?, payment_method=? WHERE id=?", (new_status, "VERIFIED_BY_ADMIN", order_id))
+    else:
+        new_status = "AWAITING_PAYMENT"
+        c.execute("UPDATE orders SET status=?, payment_notified=0 WHERE id=?", (new_status, order_id))
+    c.commit()
+    c.close()
+
+    order_number = f"AD-{order_id:05d}"
+    await send_order_status_notification(context, row["user_id"], order_number, new_status)
+    return row
+
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Broadcast a launch/promotion message to customers who have placed an order."""
+    if not is_admin(update):
+        return
+    message = update.message.text.partition(" ")[2].strip()
+    if not message:
+        await update.message.reply_text(
+            "📣 *Broadcast*\n\nUse:\n/broadcast Your announcement here\n\nExample:\n/broadcast 🖤 New arrivals are now available at AD Fashion Hijabs & More!",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    c = conn()
+    rows = c.execute("SELECT DISTINCT user_id FROM orders WHERE user_id IS NOT NULL").fetchall()
+    c.close()
+    sent = 0
+    failed = 0
+    for row in rows:
+        try:
+            await context.bot.send_message(
+                chat_id=row["user_id"],
+                text=f"📣 *{NAME}*\n\n{message}",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            sent += 1
+        except Exception:
+            failed += 1
+            logger.exception("Broadcast failed for user %s", row["user_id"])
+        await asyncio.sleep(0.05)
+
+    await update.message.reply_text(f"📣 Broadcast complete.\n\n✅ Sent: {sent}\n⚠️ Failed: {failed}")
+
+
+async def launch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    launch = (
+        "🖤 *AD FASHION HIJABS & MORE — NOW ONLINE!*\n\n"
+        "🛍️ Shop hijabs, jilbabs, textiles and more directly through our Telegram store.\n\n"
+        "✨ Modesty • Elegance • Quality\n"
+        "📍 Bauchi Central Market, Bauchi\n\n"
+        "Tap /start to begin shopping."
+    )
+    await update.message.reply_text(
+        launch,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🛍️ Shop Now", callback_data="shop")],
+            [InlineKeyboardButton("🌐 Website", url=WEBSITE)],
+            [InlineKeyboardButton("💬 WhatsApp", url=f"https://wa.me/{WHATSAPP}")],
+        ]),
+    )
+
+
 async def payment_done(update: Update, context: ContextTypes.DEFAULT_TYPE, order_id_text: str):
     query = update.callback_query
     try:
@@ -462,7 +562,16 @@ async def payment_done(update: Update, context: ContextTypes.DEFAULT_TYPE, order
         "⚠️ Customer says payment has been made. Please verify the bank transaction before marking the order as PAID."
     )
     try:
-        await context.bot.send_message(chat_id=ADMIN_ID, text=admin_text, parse_mode=ParseMode.MARKDOWN)
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=admin_text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Verify Payment", callback_data=f"adm:payverify:{order_id}:yes")],
+                [InlineKeyboardButton("⚠️ Payment Not Verified", callback_data=f"adm:payverify:{order_id}:no")],
+                [InlineKeyboardButton("📦 View Order", callback_data=f"adm:order:{order_id}")],
+            ]),
+        )
     except Exception:
         logger.exception("Could not send payment notification to admin.")
 
@@ -1524,19 +1633,7 @@ async def update_order_status(context: ContextTypes.DEFAULT_TYPE, order_id: int,
 
     order_number = f"AD-{order_id:05d}"
 
-    try:
-        await context.bot.send_message(
-            chat_id=row["user_id"],
-            text=(
-                f"📦 *Order #{order_number} Update*\n\n"
-                f"Your order status is now:\n"
-                f"*{new_status.replace('_', ' ')}*"
-            ),
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    except Exception:
-        logger.exception("Could not notify customer about status change.")
-
+    await send_order_status_notification(context, row["user_id"], order_number, new_status)
     return row
 
 
@@ -1590,6 +1687,8 @@ def admin_menu():
         [InlineKeyboardButton("📋 View Orders", callback_data="adm:vieworders")],
         [InlineKeyboardButton("📊 Sales Summary", callback_data="adm:sales")],
         [InlineKeyboardButton("🚚 Delivery", callback_data="adm:delivery")],
+        [InlineKeyboardButton("💳 Payments", callback_data="adm:payments")],
+        [InlineKeyboardButton("📣 Marketing & Launch", callback_data="adm:marketing")],
         [InlineKeyboardButton("⚙️ Settings", callback_data="adm:settings")],
     ])
 
@@ -1945,6 +2044,90 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await handle_admin_callback(update, context, "adm:delivery")
         return
 
+    if data.startswith("adm:payverify:"):
+        parts = data.split(":")
+        try:
+            order_id = int(parts[2])
+        except (ValueError, IndexError):
+            await query.edit_message_text("⚠️ Invalid order.", reply_markup=admin_back_button())
+            return
+        approved = len(parts) > 3 and parts[3] == "yes"
+        row = await verify_payment(context, order_id, approved)
+        if not row:
+            await query.edit_message_text("⚠️ Order not found.", reply_markup=admin_back_button())
+            return
+        order_number = f"AD-{order_id:05d}"
+        if approved:
+            text = f"✅ *Payment verified* for #{order_number}.\n\nCustomer has been notified and the order is now PAID."
+        else:
+            text = f"⚠️ Payment for #{order_number} was not verified.\n\nThe customer has been notified that payment is still awaiting verification."
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=admin_back_button())
+        return
+
+    if data.startswith("adm:order:"):
+        try:
+            order_id = int(data.split(":", 2)[2])
+        except ValueError:
+            await query.edit_message_text("⚠️ Invalid order.", reply_markup=admin_back_button())
+            return
+        c = conn()
+        row = c.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+        c.close()
+        if not row:
+            await query.edit_message_text("⚠️ Order not found.", reply_markup=admin_back_button())
+            return
+        order_number = f"AD-{order_id:05d}"
+        text = (
+            f"📦 *Order #{order_number}*\n\n"
+            f"👤 {row['customer_name']}\n📞 {row['phone']}\n"
+            f"🚚 {DELIVERY_LABELS.get(row['delivery_method'] or 'pickup', row['delivery_method'] or 'pickup')}\n"
+            f"📍 {row['address']}\n🏙️ {row['city'] or '-'}, {row['state'] or '-'}\n\n"
+            f"Items:\n{row['items']}\n\n"
+            f"💰 *{money(row['total'])}*\n"
+            f"Status: *{fmt_status(row['status'])}*\n"
+            f"Payment receipt: {'✅ Received' if row['receipt_file_id'] else '— Not attached'}"
+        )
+        buttons = [
+            [InlineKeyboardButton("💳 Verify Payment", callback_data=f"adm:payverify:{order_id}:yes")],
+            [InlineKeyboardButton("🛠️ Processing", callback_data=f"adm:setstatus:{order_id}:PROCESSING")],
+            [InlineKeyboardButton("🛵 Out for Delivery", callback_data=f"adm:setstatus:{order_id}:OUT_FOR_DELIVERY")],
+            [InlineKeyboardButton("✅ Delivered", callback_data=f"adm:setstatus:{order_id}:DELIVERED")],
+            [InlineKeyboardButton("❌ Cancel Order", callback_data=f"adm:setstatus:{order_id}:CANCELLED")],
+            [InlineKeyboardButton("⬅️ Orders", callback_data="adm:vieworders")],
+        ]
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data == "adm:payments":
+        c = conn()
+        rows = c.execute(
+            "SELECT * FROM orders WHERE payment_notified=1 OR receipt_file_id!='' ORDER BY id DESC LIMIT 10"
+        ).fetchall()
+        c.close()
+        lines = ["💳 *Payment Verification*\n"]
+        buttons = []
+        if not rows:
+            lines.append("No customer payment notifications yet.")
+        else:
+            for row in rows:
+                order_number = f"AD-{row['id']:05d}"
+                lines.append(f"#{order_number} — {row['customer_name']} — {money(row['total'])} — *{fmt_status(row['status'])}*")
+                buttons.append([InlineKeyboardButton(f"🔎 Review #{order_number}", callback_data=f"adm:order:{row['id']}")])
+        buttons.append([InlineKeyboardButton("⬅️ Back to Admin Panel", callback_data="adm:home")])
+        await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data == "adm:marketing":
+        text = (
+            "📣 *Marketing & Launch*\n\n"
+            "Use the commands below from your admin account:\n\n"
+            "*/launch* — Generate the official launch message with Shop, Website and WhatsApp buttons.\n\n"
+            "*/broadcast MESSAGE* — Send a promotion/announcement to customers who have ordered before.\n\n"
+            "Example:\n`/broadcast 🖤 New arrivals are now available! Tap /start to shop.`"
+        )
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=admin_back_button())
+        return
+
     if data == "adm:settings":
         accepting = is_accepting_orders()
         text = (
@@ -2143,7 +2326,7 @@ def health():
     return {
         "status": "ok",
         "service": NAME,
-        "phase": "5",
+        "phase": "6",
     }
 
 
@@ -2185,6 +2368,8 @@ def main():
         ("setphoto", setphoto),
         ("admin_orders", admin_orders),
         ("status", status_command),
+        ("broadcast", broadcast_command),
+        ("launch", launch_command),
     ]
 
     for command, handler in commands:
