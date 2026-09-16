@@ -25,7 +25,7 @@ from telegram.ext import (
 
 # ============================================================
 # AD FASHION HIJABS & MORE — TELEGRAM SHOP BOT
-# PHASE 6: Professional Operations, Payment Verification, Marketing & Launch
+# PHASE 7: Customer Experience, Operations, Retention, Support & Growth
 # ============================================================
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -127,6 +127,72 @@ def init_db():
         c.execute("ALTER TABLE orders ADD COLUMN state TEXT DEFAULT ''")
     if "delivery_notes" not in existing_cols:
         c.execute("ALTER TABLE orders ADD COLUMN delivery_notes TEXT DEFAULT ''")
+    if "product_ids" not in existing_cols:
+        c.execute("ALTER TABLE orders ADD COLUMN product_ids TEXT DEFAULT ''")
+    if "referrer_id" not in existing_cols:
+        c.execute("ALTER TABLE orders ADD COLUMN referrer_id INTEGER")
+    if "delivery_attempts" not in existing_cols:
+        c.execute("ALTER TABLE orders ADD COLUMN delivery_attempts INTEGER DEFAULT 0")
+    if "delivery_updated_at" not in existing_cols:
+        c.execute("ALTER TABLE orders ADD COLUMN delivery_updated_at TIMESTAMP")
+
+    # Customer CRM / retention data.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS customers(
+            user_id INTEGER PRIMARY KEY,
+            username TEXT DEFAULT '',
+            full_name TEXT DEFAULT '',
+            phone TEXT DEFAULT '',
+            first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            source TEXT DEFAULT '',
+            referrer_id INTEGER,
+            orders_count INTEGER DEFAULT 0,
+            total_spent INTEGER DEFAULT 0,
+            is_vip INTEGER DEFAULT 0
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS reviews(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER UNIQUE,
+            user_id INTEGER,
+            rating INTEGER,
+            comment TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS support_tickets(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT DEFAULT '',
+            subject TEXT DEFAULT '',
+            message TEXT NOT NULL,
+            status TEXT DEFAULT 'OPEN',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS campaigns(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            message TEXT NOT NULL,
+            sent INTEGER DEFAULT 0,
+            failed INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS order_items(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL,
+            product_id TEXT NOT NULL,
+            product_name TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            unit_price INTEGER DEFAULT 0
+        )
+    """)
 
     # Phase 5 settings store (key/value).
     c.execute("""
@@ -273,12 +339,16 @@ def main_menu():
             InlineKeyboardButton("📦 My Orders", callback_data="orders"),
         ],
         [
+            InlineKeyboardButton("❓ Help & FAQ", callback_data="help"),
+            InlineKeyboardButton("🎧 Support", callback_data="support"),
+        ],
+        [
             InlineKeyboardButton("📞 Contact Us", callback_data="contact"),
             InlineKeyboardButton("📍 Location", callback_data="location"),
         ],
+        [InlineKeyboardButton("🎁 Refer a Friend", callback_data="referral")],
         [InlineKeyboardButton("🌐 Visit Website", url=WEBSITE)],
     ])
-
 
 def back_menu(callback_data="home"):
     return InlineKeyboardMarkup([
@@ -372,23 +442,78 @@ def clear_checkout_data(context):
         context.user_data.pop(key, None)
 
 
+# -------------------- CUSTOMER CRM / RETENTION HELPERS --------------------
+
+def upsert_customer(user, source="", referrer_id=None):
+    if not user:
+        return
+    c = conn()
+    row = c.execute("SELECT * FROM customers WHERE user_id=?", (user.id,)).fetchone()
+    if row:
+        c.execute("""UPDATE customers SET username=?, full_name=?, last_seen=CURRENT_TIMESTAMP,
+                    phone=CASE WHEN ?!='' THEN ? ELSE phone END,
+                    source=CASE WHEN ?!='' THEN ? ELSE source END
+                    WHERE user_id=?""",
+                  (user.username or '', user.full_name or '', '', '', source, source, user.id))
+    else:
+        c.execute("""INSERT INTO customers(user_id, username, full_name, source, referrer_id)
+                     VALUES(?,?,?,?,?)""",
+                  (user.id, user.username or '', user.full_name or '', source or '', referrer_id))
+    c.commit(); c.close()
+
+
+def customer_stats(user_id):
+    c=conn(); row=c.execute("SELECT * FROM customers WHERE user_id=?", (user_id,)).fetchone(); c.close(); return row
+
+
+def bot_username(context):
+    return getattr(context.bot, "username", None) or "Ad_Fashion_Hijabs_and_morebot"
+
+
+def referral_link(context, user_id):
+    return f"https://t.me/{bot_username(context)}?start=ref_{user_id}"
+
+
+async def send_retention_followup(context, row):
+    order_id=row["id"]; order_number=f"AD-{order_id:05d}"
+    text=(f"🎉 *Thank you for shopping with {NAME}!*\n\n"
+          f"Order #{order_number} has been marked as delivered.\n\n"
+          "We'd love to hear about your experience. Tap a rating below, or refer a friend and earn our appreciation as a returning customer.")
+    kb=InlineKeyboardMarkup([
+        [InlineKeyboardButton("⭐ 1", callback_data=f"review:{order_id}:1"), InlineKeyboardButton("⭐ 2", callback_data=f"review:{order_id}:2"), InlineKeyboardButton("⭐ 3", callback_data=f"review:{order_id}:3"), InlineKeyboardButton("⭐ 4", callback_data=f"review:{order_id}:4"), InlineKeyboardButton("⭐ 5", callback_data=f"review:{order_id}:5")],
+        [InlineKeyboardButton("🛍️ Shop Again", callback_data="shop"), InlineKeyboardButton("🎁 Refer a Friend", callback_data="referral")],
+        [InlineKeyboardButton("🎧 Support", callback_data="support")],
+    ])
+    try:
+        await context.bot.send_message(chat_id=row["user_id"], text=text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    except Exception:
+        logger.exception("Could not send retention follow-up for %s", order_number)
+
+
 # -------------------- USER COMMANDS --------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        f"🖤 *{NAME}*\n\n"
-        f"*{TAGLINE}*\n\n"
-        "Welcome! Discover beautiful hijabs, jilbabs, "
-        "textiles and more.\n\n"
-        "Choose an option:"
-    )
-
+    user=update.effective_user
+    args=context.args or []
+    source="telegram"
+    referrer_id=None
+    if args and args[0].startswith("ref_"):
+        try:
+            candidate=int(args[0].split("_",1)[1])
+            if candidate != user.id:
+                referrer_id=candidate
+                source="referral"
+        except ValueError:
+            pass
+    upsert_customer(user, source=source, referrer_id=referrer_id)
+    stats=customer_stats(user.id)
+    vip_line="\n👑 *VIP / Returning Customer* — welcome back!" if stats and stats["is_vip"] else ""
+    text=(f"🖤 *{NAME}*\n\n*{TAGLINE}*{vip_line}\n\n"
+          "Welcome to your online modest-fashion store.\n\n"
+          "🛍️ Browse products\n🛒 Add to cart\n💳 Pay securely\n🚚 Choose delivery or pickup\n🎧 Get support anytime\n\n"
+          "Choose an option below:")
     if update.message:
-        await update.message.reply_text(
-            text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=main_menu(),
-        )
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu())
 
 
 async def shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -402,15 +527,66 @@ async def shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
-        "❓ *Help*\n\n"
-        "Use /start to open the shop.\n"
-        "Use /shop to browse products.\n"
-        "Use /cart to view your cart.\n"
-        "Use /orders to view your orders.\n"
-        "Use /contact for contact details.\n\n"
+        "❓ *AD Fashion Hijabs & More — Help Center*\n\n"
+        "🛍️ *Shopping:* /shop to browse and select products.\n"
+        "🛒 *Cart:* /cart to review items before checkout.\n"
+        "📦 *Orders:* /orders to view your order history.\n"
+        "💳 *Payment:* After checkout, follow the payment instructions and tap ‘I've Made Payment’.\n"
+        "🚚 *Delivery:* Choose pickup, Bauchi delivery or nationwide delivery during checkout.\n"
+        "🎧 *Support:* /support to contact our team.\n"
+        "❔ *FAQ:* /faq for common questions.\n\n"
         "To cancel an active checkout, send *cancel*.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+        parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu())
+
+
+async def faq_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "❔ *Frequently Asked Questions*\n\n"
+        "*How do I order?*\nBrowse → Select → Cart → Checkout → Payment → Verification → Delivery.\n\n"
+        "*How do I pay?*\nThe bot displays our available payment accounts after an order is created. Use the order number as your reference where possible.\n\n"
+        "*Can I pick up my order?*\nYes. Pickup is available at Bauchi Central Market.\n\n"
+        "*Do you deliver outside Bauchi?*\nYes. Select Nationwide Delivery and provide your city and state.\n\n"
+        "*How do I check my order?*\nUse /orders.\n\n"
+        "*Need human assistance?*\nUse /support or contact us directly.",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu())
+
+
+async def support_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["support_ticket"]="message"
+    await update.effective_message.reply_text(
+        "🎧 *Customer Support*\n\nTell us what you need help with in one message.\n\n"
+        "Examples: payment issue, delivery issue, wrong item, order question, complaint, or general enquiry.\n\n"
+        "Our team will review your request.",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="support_cancel")]]))
+
+
+async def referral_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user=update.effective_user; upsert_customer(user, source="referral")
+    link=referral_link(context,user.id)
+    await update.effective_message.reply_text(
+        "🎁 *Refer a Friend*\n\n"
+        "Share your personal shopping link with a friend. When they start the bot through your link, we'll record the referral.\n\n"
+        f"🔗 {link}\n\n"
+        "Thank you for helping AD Fashion Hijabs & More grow. 🖤✨",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu())
+
+
+async def review_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args=context.args or []
+    if len(args)<2:
+        await update.effective_message.reply_text("Use: /review ORDER_NUMBER RATING\nExample: /review AD-00001 5")
+        return
+    order_ref=args[0].upper().replace("AD-","")
+    try: order_id=int(order_ref); rating=int(args[1])
+    except ValueError:
+        await update.effective_message.reply_text("Please provide a valid order number and rating from 1 to 5."); return
+    if rating<1 or rating>5:
+        await update.effective_message.reply_text("Rating must be between 1 and 5."); return
+    c=conn(); row=c.execute("SELECT * FROM orders WHERE id=? AND user_id=?",(order_id,update.effective_user.id)).fetchone()
+    if not row:
+        c.close(); await update.effective_message.reply_text("Order not found."); return
+    c.execute("INSERT INTO reviews(order_id,user_id,rating,comment) VALUES(?,?,?,?) ON CONFLICT(order_id) DO UPDATE SET rating=excluded.rating",(order_id,update.effective_user.id,rating,"")); c.commit(); c.close()
+    await update.effective_message.reply_text("⭐ Thank you! Your rating has been recorded. You can send a short comment if you'd like.", reply_markup=main_menu())
 
 
 async def cart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -420,20 +596,30 @@ async def cart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_order_status_notification(context, user_id, order_number, status):
     """Send a consistent customer-facing status notification."""
     messages = {
-        "PAID": "💳 Payment verified successfully. Your order is now confirmed.",
+        "PAID": "💳 Payment verified successfully. Your order is now confirmed and ready for preparation.",
         "PROCESSING": "🛠️ Your order is now being prepared.",
-        "OUT_FOR_DELIVERY": "🛵 Your order is on the way to you.",
+        "OUT_FOR_DELIVERY": "🛵 Your order is on the way to you. Please keep your phone available for the rider/courier.",
+        "DELIVERY_FAILED": "⚠️ We could not complete the delivery attempt. Our team will contact you to arrange the next step.",
         "DELIVERED": "🎉 Your order has been marked as delivered. Thank you for shopping with us!",
         "CANCELLED": "❌ Your order has been cancelled. Please contact us if you need assistance.",
-        "AWAITING_PAYMENT": "⏳ Your order is waiting for payment.",
+        "AWAITING_PAYMENT": "⏳ Your order is waiting for payment. Complete payment and notify us when done.",
         "PENDING": "📦 Your order is pending review.",
     }
     body = messages.get(status, f"📦 Your order status is now: {status.replace('_', ' ')}")
     try:
+        keyboard=None
+        if status == "DELIVERED":
+            order_id=int(order_number.replace("AD-", ""))
+            keyboard=InlineKeyboardMarkup([[InlineKeyboardButton("⭐ Rate Order", callback_data=f"review:{order_id}:5"), InlineKeyboardButton("🛍️ Shop Again", callback_data="shop")], [InlineKeyboardButton("🎁 Refer a Friend", callback_data="referral")]])
+        elif status == "OUT_FOR_DELIVERY":
+            order_id=int(order_number.replace("AD-", ""))
+            keyboard=InlineKeyboardMarkup([[InlineKeyboardButton("📍 I Received My Order", callback_data=f"delivery_confirm:{order_id}")],[InlineKeyboardButton("🎧 Support", callback_data="support")]])
+        elif status in {"AWAITING_PAYMENT", "PAID"}:
+            keyboard=InlineKeyboardMarkup([[InlineKeyboardButton("📦 My Orders", callback_data="orders")],[InlineKeyboardButton("🎧 Support", callback_data="support")]])
         await context.bot.send_message(
             chat_id=user_id,
             text=f"📦 *Order #{order_number} Update*\n\n{body}\n\nStatus: *{status.replace('_', ' ')}*",
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard,
         )
         return True
     except Exception:
@@ -458,8 +644,14 @@ async def verify_payment(context, order_id: int, approved: bool):
     c.commit()
     c.close()
 
+    c=conn()
+    c.execute("""UPDATE customers SET orders_count=orders_count+1, total_spent=total_spent+?, phone=?, last_seen=CURRENT_TIMESTAMP, is_vip=CASE WHEN orders_count+1>=3 THEN 1 ELSE is_vip END WHERE user_id=?""", (total or 0, phone, user.id))
+    c.commit(); c.close()
+
     order_number = f"AD-{order_id:05d}"
     await send_order_status_notification(context, row["user_id"], order_number, new_status)
+    if new_status == "DELIVERED":
+        await send_retention_followup(context, row)
     return row
 
 
@@ -475,9 +667,9 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    c = conn()
-    rows = c.execute("SELECT DISTINCT user_id FROM orders WHERE user_id IS NOT NULL").fetchall()
-    c.close()
+    campaign_name = "Broadcast " + __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M")
+    c = conn(); cur=c.execute("INSERT INTO campaigns(name,message) VALUES(?,?)",(campaign_name,message)); campaign_id=cur.lastrowid
+    rows = c.execute("SELECT DISTINCT user_id FROM orders WHERE user_id IS NOT NULL").fetchall(); c.close()
     sent = 0
     failed = 0
     for row in rows:
@@ -493,7 +685,19 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.exception("Broadcast failed for user %s", row["user_id"])
         await asyncio.sleep(0.05)
 
-    await update.message.reply_text(f"📣 Broadcast complete.\n\n✅ Sent: {sent}\n⚠️ Failed: {failed}")
+    c=conn(); c.execute("UPDATE campaigns SET sent=?, failed=? WHERE id=?",(sent,failed,campaign_id)); c.commit(); c.close()
+    await update.message.reply_text(f"📣 Broadcast complete.\n\n✅ Sent: {sent}\n⚠️ Failed: {failed}\n\nCampaign recorded for performance tracking.")
+
+
+async def campaigns_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update): return
+    c=conn(); rows=c.execute("SELECT * FROM campaigns ORDER BY id DESC LIMIT 10").fetchall(); c.close()
+    if not rows: await update.message.reply_text("No campaigns recorded yet."); return
+    lines=["📣 *Campaign Performance*\n"]
+    for r in rows:
+        total=r['sent']+r['failed']; rate=(r['sent']/total*100) if total else 0
+        lines.append(f"*{r['name']}*\n✅ Sent: {r['sent']} | ⚠️ Failed: {r['failed']} | Delivery rate: {rate:.0f}%")
+    await update.message.reply_text("\n\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
 async def launch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -913,8 +1117,8 @@ async def create_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
         INSERT INTO orders
         (user_id, username, customer_name, phone, address, items, total,
-         status, delivery_method, city, state, delivery_notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         status, delivery_method, city, state, delivery_notes, product_ids, referrer_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             user.id,
@@ -929,10 +1133,17 @@ async def create_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             city,
             state,
             notes,
+            ",".join(str(k) for k in cart.keys()),
+            (customer_stats(user.id)["referrer_id"] if customer_stats(user.id) else None),
         ),
     )
 
     order_id = cursor.lastrowid
+    for pid, qty in cart.items():
+        product = get_product(pid)
+        if product:
+            c.execute("INSERT INTO order_items(order_id,product_id,product_name,quantity,unit_price) VALUES(?,?,?,?,?)",
+                      (order_id, pid, product["name"], qty, product["price"] or 0))
     c.commit()
     c.close()
 
@@ -1042,6 +1253,22 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_edit = context.user_data.get("admin_edit")
     if admin_edit and is_admin(update):
         await handle_admin_edit_step(message, context, admin_edit, text)
+        return
+
+    if context.user_data.get("review_order"):
+        order_id=context.user_data.pop("review_order")
+        c=conn(); c.execute("UPDATE reviews SET comment=? WHERE order_id=? AND user_id=?", (text[:500], order_id, update.effective_user.id)); c.commit(); c.close()
+        await message.reply_text("❤️ Thank you for your feedback. We appreciate your support!", reply_markup=main_menu())
+        return
+
+    if context.user_data.get("support_ticket") == "message":
+        context.user_data.pop("support_ticket", None)
+        user=update.effective_user
+        c=conn(); cur=c.execute("INSERT INTO support_tickets(user_id,username,subject,message) VALUES(?,?,?,?)",(user.id,user.username or '',"Customer Support",text)); ticket_id=cur.lastrowid; c.commit(); c.close()
+        try:
+            await context.bot.send_message(chat_id=ADMIN_ID, text=f"🎧 *Support Ticket #{ticket_id}*\n\nCustomer: {user.full_name}\nUsername: @{user.username or 'none'}\nTelegram ID: `{user.id}`\n\n{text}", parse_mode=ParseMode.MARKDOWN)
+        except Exception: logger.exception("Could not notify admin about support ticket")
+        await message.reply_text(f"✅ Support request #{ticket_id} received. Our team will get back to you.", reply_markup=main_menu())
         return
 
     state = context.user_data.get("checkout")
@@ -1285,6 +1512,59 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN,
         )
         await start_delivery_details(update, context, method)
+
+    elif data == "help":
+        await help_cmd(update, context)
+
+    elif data == "support":
+        await support_cmd(update, context)
+
+    elif data == "support_cancel":
+        context.user_data.pop("support_ticket", None)
+        await query.edit_message_text("Support request cancelled.", reply_markup=main_menu())
+
+    elif data == "referral":
+        user=update.effective_user; upsert_customer(user, source="referral")
+        c=conn(); referral_count=c.execute("SELECT COUNT(*) FROM customers WHERE referrer_id=?",(user.id,)).fetchone()[0]; c.close()
+        await query.edit_message_text(
+            "🎁 *Refer a Friend*\n\n"
+            f"Share this link with a friend:\n\n{referral_link(context,user.id)}\n\n"
+            f"👥 Referrals recorded: {referral_count}\n\n"
+            "When they start the bot through your link, the referral is recorded. 🖤✨",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu())
+
+    elif data.startswith("review:"):
+        _, order_id_text, rating_text=data.split(":",2)
+        try: order_id=int(order_id_text); rating=int(rating_text)
+        except ValueError: await query.edit_message_text("Invalid review.", reply_markup=main_menu()); return
+        c=conn(); row=c.execute("SELECT * FROM orders WHERE id=? AND user_id=?",(order_id,update.effective_user.id)).fetchone()
+        if not row:
+            c.close(); await query.edit_message_text("Order not found.", reply_markup=main_menu()); return
+        c.execute("INSERT INTO reviews(order_id,user_id,rating,comment) VALUES(?,?,?,?) ON CONFLICT(order_id) DO UPDATE SET rating=excluded.rating",(order_id,update.effective_user.id,rating,"")); c.commit(); c.close()
+        context.user_data["review_order"]=order_id
+        await query.edit_message_text(f"⭐ Thank you for rating Order #AD-{order_id:05d} {rating}/5.\n\nYou may now send a short comment, or type *skip*.", parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu())
+
+    elif data.startswith("reorder:"):
+        try: order_id=int(data.split(":",1)[1])
+        except ValueError: await query.edit_message_text("Invalid order.", reply_markup=main_menu()); return
+        c=conn(); row=c.execute("SELECT * FROM orders WHERE id=? AND user_id=?",(order_id,update.effective_user.id)).fetchone(); c.close()
+        if not row or not row["product_ids"]:
+            await query.edit_message_text("Some products from this order are no longer available. Please shop again.", reply_markup=main_menu()); return
+        cart=context.user_data.setdefault("cart", {})
+        added=0
+        for pid in row["product_ids"].split(","):
+            if get_product(pid): cart[pid]=cart.get(pid,0)+1; added+=1
+        await query.edit_message_text(f"🛒 Added {added} item(s) from Order #AD-{order_id:05d} to your cart.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛒 View Cart", callback_data="cart")],[InlineKeyboardButton("🛍️ Shop More", callback_data="shop")]]))
+
+    elif data.startswith("delivery_confirm:"):
+        try: order_id=int(data.split(":",1)[1])
+        except ValueError: await query.edit_message_text("Invalid order.", reply_markup=main_menu()); return
+        c=conn(); row=c.execute("SELECT * FROM orders WHERE id=? AND user_id=?",(order_id,update.effective_user.id)).fetchone(); c.close()
+        if row:
+            try: await context.bot.send_message(chat_id=ADMIN_ID, text=f"📍 Customer says Order #AD-{order_id:05d} has been received. Please confirm delivery.")
+            except Exception: logger.exception("Could not notify admin of delivery confirmation")
+            await query.edit_message_text("✅ Thank you. We've notified our team.", reply_markup=main_menu())
+        else: await query.edit_message_text("Order not found.", reply_markup=main_menu())
 
     elif data == "orders":
         await orders_cmd(update, context)
@@ -1607,6 +1887,7 @@ ALLOWED_STATUSES = {
     "PAID",
     "PROCESSING",
     "OUT_FOR_DELIVERY",
+    "DELIVERY_FAILED",
     "DELIVERED",
     "CANCELLED",
 }
@@ -1624,10 +1905,12 @@ async def update_order_status(context: ContextTypes.DEFAULT_TYPE, order_id: int,
         c.close()
         return None
 
-    c.execute(
-        "UPDATE orders SET status=? WHERE id=?",
-        (new_status, order_id),
-    )
+    if new_status == "DELIVERY_FAILED":
+        c.execute("UPDATE orders SET status=?, delivery_attempts=delivery_attempts+1, delivery_updated_at=CURRENT_TIMESTAMP WHERE id=?", (new_status, order_id))
+    elif new_status in {"OUT_FOR_DELIVERY", "DELIVERED"}:
+        c.execute("UPDATE orders SET status=?, delivery_updated_at=CURRENT_TIMESTAMP WHERE id=?", (new_status, order_id))
+    else:
+        c.execute("UPDATE orders SET status=? WHERE id=?", (new_status, order_id))
     c.commit()
     c.close()
 
@@ -1686,7 +1969,10 @@ def admin_menu():
         [InlineKeyboardButton("📦 Products", callback_data="adm:products")],
         [InlineKeyboardButton("📋 View Orders", callback_data="adm:vieworders")],
         [InlineKeyboardButton("📊 Sales Summary", callback_data="adm:sales")],
+        [InlineKeyboardButton("📈 Weekly Business Review", callback_data="adm:weekly")],
         [InlineKeyboardButton("🚚 Delivery", callback_data="adm:delivery")],
+        [InlineKeyboardButton("🎧 Support Tickets", callback_data="adm:support")],
+        [InlineKeyboardButton("⭐ Customer Reviews", callback_data="adm:reviews")],
         [InlineKeyboardButton("💳 Payments", callback_data="adm:payments")],
         [InlineKeyboardButton("📣 Marketing & Launch", callback_data="adm:marketing")],
         [InlineKeyboardButton("⚙️ Settings", callback_data="adm:settings")],
@@ -2091,6 +2377,7 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
             [InlineKeyboardButton("💳 Verify Payment", callback_data=f"adm:payverify:{order_id}:yes")],
             [InlineKeyboardButton("🛠️ Processing", callback_data=f"adm:setstatus:{order_id}:PROCESSING")],
             [InlineKeyboardButton("🛵 Out for Delivery", callback_data=f"adm:setstatus:{order_id}:OUT_FOR_DELIVERY")],
+            [InlineKeyboardButton("⚠️ Delivery Failed", callback_data=f"adm:setstatus:{order_id}:DELIVERY_FAILED")],
             [InlineKeyboardButton("✅ Delivered", callback_data=f"adm:setstatus:{order_id}:DELIVERED")],
             [InlineKeyboardButton("❌ Cancel Order", callback_data=f"adm:setstatus:{order_id}:CANCELLED")],
             [InlineKeyboardButton("⬅️ Orders", callback_data="adm:vieworders")],
@@ -2122,11 +2409,48 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
             "📣 *Marketing & Launch*\n\n"
             "Use the commands below from your admin account:\n\n"
             "*/launch* — Generate the official launch message with Shop, Website and WhatsApp buttons.\n\n"
-            "*/broadcast MESSAGE* — Send a promotion/announcement to customers who have ordered before.\n\n"
+            "*/broadcast MESSAGE* — Send a promotion/announcement to customers who have ordered before.\n"
+            "*/campaigns* — View recent promotion performance.\n\n"
+            "Reusable campaign ideas: Launch • Weekend Offer • New Arrival • Eid/Ramadan • Customer Appreciation • Referral • Flash Sale • Bundle • Repeat Customer.\n\n"
             "Example:\n`/broadcast 🖤 New arrivals are now available! Tap /start to shop.`"
         )
         await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=admin_back_button())
         return
+
+    if data == "adm:weekly":
+        c=conn()
+        total_orders=c.execute("SELECT COUNT(*) FROM orders WHERE created_at >= datetime('now','-7 days')").fetchone()[0]
+        completed=c.execute("SELECT COUNT(*) FROM orders WHERE status='DELIVERED' AND created_at >= datetime('now','-7 days')").fetchone()[0]
+        cancelled=c.execute("SELECT COUNT(*) FROM orders WHERE status='CANCELLED' AND created_at >= datetime('now','-7 days')").fetchone()[0]
+        revenue=c.execute("SELECT COALESCE(SUM(total),0) FROM orders WHERE status IN ('PAID','PROCESSING','OUT_FOR_DELIVERY','DELIVERED') AND created_at >= datetime('now','-7 days')").fetchone()[0]
+        customers=c.execute("SELECT COUNT(*) FROM customers WHERE first_seen >= datetime('now','-7 days')").fetchone()[0]
+        reviews=c.execute("SELECT COUNT(*), COALESCE(AVG(rating),0) FROM reviews WHERE created_at >= datetime('now','-7 days')").fetchone()
+        top=c.execute("""SELECT product_name, SUM(quantity) AS qty FROM order_items oi JOIN orders o ON o.id=oi.order_id
+                         WHERE o.status IN ('PAID','PROCESSING','OUT_FOR_DELIVERY','DELIVERED')
+                         AND o.created_at >= datetime('now','-7 days') GROUP BY product_id, product_name ORDER BY qty DESC LIMIT 5""").fetchall()
+        referrals=c.execute("SELECT COUNT(*) FROM customers WHERE source='referral' AND first_seen >= datetime('now','-7 days')").fetchone()[0]
+        paid=c.execute("SELECT COUNT(*) FROM orders WHERE status IN ('PAID','PROCESSING','OUT_FOR_DELIVERY','DELIVERED') AND created_at >= datetime('now','-7 days')").fetchone()[0]
+        unpaid=c.execute("SELECT COUNT(*) FROM orders WHERE status='AWAITING_PAYMENT' AND created_at >= datetime('now','-7 days')").fetchone()[0]
+        delivery_failed=c.execute("SELECT COUNT(*) FROM orders WHERE status='DELIVERY_FAILED' AND created_at >= datetime('now','-7 days')").fetchone()[0]
+        campaign=c.execute("SELECT COALESCE(SUM(sent),0), COALESCE(SUM(failed),0) FROM campaigns WHERE created_at >= datetime('now','-7 days')").fetchone()
+        c.close()
+        best="\n".join([f"• {r['product_name']} × {r['qty']}" for r in top]) or "• No product sales recorded yet"
+        text=("📈 *7-Day Business Review*\n\n" f"📦 Orders: {total_orders}\n" f"✅ Delivered: {completed}\n" f"❌ Cancelled: {cancelled}\n" f"💰 Confirmed sales: {money(revenue)}\n" f"💳 Paid/confirmed orders: {paid}\n" f"⏳ Awaiting payment: {unpaid}\n" f"👥 New customers: {customers}\n" f"🎁 Referral customers: {referrals}\n" f"⚠️ Delivery failures: {delivery_failed}\n" f"📣 Campaign messages: {campaign[0]} sent / {campaign[1]} failed\n" f"⭐ Reviews: {reviews[0]} | Avg rating: {reviews[1]:.1f}/5\n\n" f"🏆 *Best-selling products*\n{best}\n\n" "Use this report weekly to compare sales, delivery, customer growth, promotions and feedback.")
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=admin_back_button()); return
+
+    if data == "adm:support":
+        c=conn(); rows=c.execute("SELECT * FROM support_tickets ORDER BY id DESC LIMIT 10").fetchall(); c.close()
+        lines=["🎧 *Recent Support Tickets*\n"]
+        for r in rows: lines.append(f"#{r['id']} — @{r['username'] or 'none'} — *{r['status']}*\n{r['message'][:180]}")
+        if not rows: lines.append("No support tickets yet.")
+        await query.edit_message_text("\n\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=admin_back_button()); return
+
+    if data == "adm:reviews":
+        c=conn(); rows=c.execute("SELECT * FROM reviews ORDER BY id DESC LIMIT 10").fetchall(); avg=c.execute("SELECT COALESCE(AVG(rating),0) FROM reviews").fetchone()[0]; c.close()
+        lines=[f"⭐ *Customer Reviews* — Average {avg:.1f}/5\n"]
+        for r in rows: lines.append(f"Order #{r['order_id']} — {r['rating']}/5\n{r['comment'] or 'No comment'}")
+        if not rows: lines.append("No reviews yet.")
+        await query.edit_message_text("\n\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=admin_back_button()); return
 
     if data == "adm:settings":
         accepting = is_accepting_orders()
@@ -2326,7 +2650,7 @@ def health():
     return {
         "status": "ok",
         "service": NAME,
-        "phase": "6",
+        "phase": "7",
     }
 
 
@@ -2369,7 +2693,12 @@ def main():
         ("admin_orders", admin_orders),
         ("status", status_command),
         ("broadcast", broadcast_command),
+        ("campaigns", campaigns_command),
         ("launch", launch_command),
+        ("faq", faq_cmd),
+        ("support", support_cmd),
+        ("referral", referral_cmd),
+        ("review", review_command),
     ]
 
     for command, handler in commands:
