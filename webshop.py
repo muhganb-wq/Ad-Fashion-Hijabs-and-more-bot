@@ -19,10 +19,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 
 from flask import (
-    Blueprint, abort, flash, g, redirect, render_template_string,
+    Blueprint, abort, flash, g, has_request_context, redirect, render_template_string,
     request, send_file, session, url_for, Response,
 )
 from markupsafe import Markup
@@ -94,7 +95,7 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 PHONE_EXEMPT = {"web.complete_profile", "web.logout", "web.icon_maskable", "web.push_key", "web.admin_lock_route"}
 PUBLIC_ENDPOINTS = {
     "web.home", "web.login", "web.register_page", "web.manifest", "web.service_worker",
-    "web.google_auth", "web.pubimg", "web.qr_png", "web.qr_card", "web.icon", "web.brand_logo", "web.brand_flyer", "web.health", "web.robots",
+    "web.google_auth", "web.pubimg", "web.pubvid", "web.qr_png", "web.qr_card", "web.icon", "web.brand_logo", "web.brand_flyer", "web.health", "web.robots",
 }
 _login_attempts = {}
 
@@ -163,6 +164,10 @@ def init_web_db():
         CREATE TABLE IF NOT EXISTS social_posts(
             id INTEGER PRIMARY KEY AUTOINCREMENT, product_id TEXT, platform TEXT, status TEXT,
             remote_id TEXT DEFAULT '', error TEXT DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+        CREATE TABLE IF NOT EXISTS share_jobs(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, product_id TEXT DEFAULT '', kind TEXT, want TEXT DEFAULT '[]',
+            picked TEXT DEFAULT '[]', caps TEXT DEFAULT '{}', take INTEGER DEFAULT 0, status TEXT DEFAULT 'queued',
+            result TEXT DEFAULT '[]', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, finished_at TIMESTAMP);
         CREATE TABLE IF NOT EXISTS wa_sent(user_id INTEGER PRIMARY KEY, sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
         CREATE INDEX IF NOT EXISTS idx_notif_user ON notifications(user_id, is_read);
     """)
@@ -174,6 +179,7 @@ def init_web_db():
     addcol("orders", "web_user_id", "INTEGER")
     addcol("orders", "received_confirmed", "INTEGER DEFAULT 0")
     addcol("social_posts", "caption", "TEXT DEFAULT ''")
+    addcol("social_posts", "auto", "INTEGER DEFAULT 0")
     addcol("orders", "points_awarded", "INTEGER DEFAULT 0")
     if c.execute("PRAGMA table_info(products)").fetchall() and "added_at" not in {r[1] for r in c.execute("PRAGMA table_info(products)")}:
         c.execute("ALTER TABLE products ADD COLUMN added_at TEXT")
@@ -2950,8 +2956,17 @@ def _pub_sig(fid):
                     fid.encode(), hashlib.sha256).hexdigest()[:24]
 
 
+def site_base():
+    env = os.environ.get("SITE_URL")
+    if env:
+        return env.rstrip("/")
+    if has_request_context():
+        return request.host_url.rstrip("/")
+    return (setting("site_seen") or "").rstrip("/")
+
+
 def pub_img_url(fid, fit=False):
-    base = (os.environ.get("SITE_URL") or request.host_url).rstrip("/")
+    base = site_base()
     return f"{base}/pubimg/{_pub_sig(fid)}/{fid}.jpg" + ("?fit=45" if fit else "")
 
 
@@ -3178,7 +3193,7 @@ def _build(p, platform, shuffle=0):
         lines.append(f"🎉 {pct}% OFF right now!")
     lines.append(enders[ei])
     wa = CFG.get("WHATSAPP", "")
-    site = (os.environ.get("SITE_URL") or request.host_url).rstrip("/")
+    site = site_base()
     if platform == "ig":
         lines.append(rnd.choice(_ORDER_IG) + (f" or WhatsApp {wa}" if wa else ""))
         lines.append("📍 Bauchi, Nigeria · Delivery nationwide")
@@ -3211,14 +3226,14 @@ def post_facebook(img_urls, caption):
     return r.get("id", "")
 
 
-def _ig_wait(cid, tok, base):
-    for _ in range(15):                          # wait until Instagram has fetched the picture
+def _ig_wait(cid, tok, base, tries=15, pause=2):
+    for _ in range(tries):                       # wait until Instagram has fetched the picture or video
         st = _graph("GET", f"/{cid}", {"fields": "status_code", "access_token": tok}, base=base).get("status_code", "FINISHED")
         if st == "FINISHED":
             return
         if st in ("ERROR", "EXPIRED"):
-            raise RuntimeError("Instagram could not use this picture.")
-        time.sleep(2)
+            raise RuntimeError("Instagram could not use this picture or video.")
+        time.sleep(pause)
 
 
 def post_instagram(img_urls, caption):
@@ -3244,11 +3259,258 @@ def share_photos(pid):
     return [x["file_id"] for x in product_photos(pid)][:10]
 
 
+def do_share(p, picked, want, caps=None, auto=0):
+    """Post one product (all chosen photos) to the wanted platforms. Returns a list of messages."""
+    rdy, caps, out, pid = social_ready(), caps or {}, [], p["id"]
+    for plat, fn in (("fb", post_facebook), ("ig", post_instagram)):
+        if plat not in want or not rdy[plat]:
+            continue
+        label = "Facebook" if plat == "fb" else "Instagram"
+        caption = (caps.get(plat) or "").strip()
+        if not caption:
+            caption = fresh_caption(p, plat)
+        elif _norm(caption) in used_captions(pid, label):
+            caption = fresh_caption(p, plat)
+            out.append(f"ℹ️ That {label} caption was used before, so a new one was written.")
+        caption = caption[:2100]
+        urls = [pub_img_url(f, fit=(plat == "ig" and len(picked) > 1)) for f in picked]
+        try:
+            rid = fn(urls, caption)
+            db().execute("INSERT INTO social_posts(product_id,platform,status,remote_id,caption,auto) VALUES(?,?,?,?,?,?)",
+                         (pid, label, "ok", str(rid), caption, auto))
+            out.append(f"✅ Posted to {label}" + (f" ({len(picked)} photos)" if len(picked) > 1 else ""))
+        except Exception as e:
+            db().execute("INSERT INTO social_posts(product_id,platform,status,error,auto) VALUES(?,?,?,?,?)",
+                         (pid, label, "failed", str(e)[:300], auto))
+            out.append(f"❌ {label} failed: {e}")
+        db().commit()
+    return out
+
+
+# ---- background sending: tapping Post only queues a job; the server finishes it even if you leave the app
+JOBS_SYNC = False            # tests switch this on to run a job in the same request
+
+
+def queue_job(kind, pid="", want=(), picked=(), caps=None, take=0):
+    """Queue a post and start it in the background. Returns the job id, or None if the same post is already on its way."""
+    from flask import current_app
+    if db().execute("""SELECT 1 FROM share_jobs WHERE product_id=? AND kind=? AND status IN ('queued','working')
+                       AND created_at>=datetime('now','-10 minutes')""", (pid, kind)).fetchone():
+        return None
+    if not os.environ.get("SITE_URL") and has_request_context():
+        set_setting("site_seen", request.host_url.rstrip("/"))
+    cur = db().execute("INSERT INTO share_jobs(product_id,kind,want,picked,caps,take) VALUES(?,?,?,?,?,?)",
+                       (pid, kind, json.dumps(list(want)), json.dumps(list(picked)), json.dumps(caps or {}), take))
+    db().commit()
+    jid, app = cur.lastrowid, current_app._get_current_object()
+    if JOBS_SYNC:
+        run_job(app, jid)
+    else:
+        threading.Thread(target=run_job, args=(app, jid), daemon=True, name=f"share-{jid}").start()
+    return jid
+
+
+def run_job(flask_app, jid):
+    with flask_app.app_context():
+        try:
+            j = db().execute("SELECT * FROM share_jobs WHERE id=?", (jid,)).fetchone()
+            if not j:
+                return
+            db().execute("UPDATE share_jobs SET status='working' WHERE id=?", (jid,))
+            db().commit()
+            want, picked, caps = json.loads(j["want"]), json.loads(j["picked"]), json.loads(j["caps"])
+            p = db().execute("SELECT * FROM products WHERE id=?", (j["product_id"],)).fetchone() if j["product_id"] else None
+            pushed = False
+            if j["kind"] == "next":
+                p, msgs = run_auto_post("manual")
+                pushed = True                                    # run_auto_post already tells the admin
+            elif not p:
+                msgs = ["❌ That product no longer exists."]
+            elif j["kind"] == "reel":
+                msgs = do_reel(p, make_reel(p, j["take"] or 0), want, caps)
+            else:
+                msgs = do_share(p, picked, want, caps)
+            good = [m for m in msgs if m.startswith("✅")]
+            bad = [m for m in msgs if m.startswith("❌")]
+            status = "done" if good and not bad else ("failed" if not good else "partial")
+            db().execute("UPDATE share_jobs SET status=?, result=?, finished_at=CURRENT_TIMESTAMP WHERE id=?",
+                         (status, json.dumps(msgs), jid))
+            db().commit()
+            if not pushed and p:
+                push_admins(("✅ Posted: " if status == "done" else "⚠️ Post problem: ") + p["name"],
+                            " · ".join(m for m in msgs if not m.startswith("ℹ️"))[:180], url="/admin/share", tag="share")
+        except Exception as e:
+            try:
+                db().execute("UPDATE share_jobs SET status='failed', result=?, finished_at=CURRENT_TIMESTAMP WHERE id=?",
+                             (json.dumps([f"❌ {e}"]), jid))
+                db().commit()
+                push_admins("⚠️ Post failed", str(e)[:150], url="/admin/share", tag="share")
+            except Exception:
+                pass
+        finally:
+            try:
+                db().close()
+            except Exception:
+                pass
+
+
+def recent_jobs(limit=5):
+    rows = db().execute("""SELECT j.*, p.name FROM share_jobs j LEFT JOIN products p ON p.id=j.product_id
+                           WHERE j.created_at>=datetime('now','-1 day') ORDER BY j.id DESC LIMIT ?""", (limit,)).fetchall()
+    out = []
+    for r in rows:
+        try:
+            msgs = json.loads(r["result"] or "[]")
+        except ValueError:
+            msgs = []
+        out.append({"id": r["id"], "name": r["name"] or "Next product", "kind": r["kind"], "status": r["status"],
+                    "msgs": msgs, "at": (r["finished_at"] or r["created_at"] or "")[11:16]})
+    return out
+
+
+# ---- automatic daily posting (morning / afternoon / evening, Nigeria time)
+LAGOS = timezone(timedelta(hours=1))
+AUTO_DEFAULT_TIMES = "08:00,13:00,19:00"
+AUTO_GRACE_MIN = 120          # a slot is still honoured up to 2 hours late (e.g. after a restart)
+AUTO_QUIET_BEFORE = 90        # you already posted by hand within 90 minutes before the slot: skip it
+
+
+def auto_times():
+    out = []
+    for t in (setting("auto_times", AUTO_DEFAULT_TIMES) or "").split(","):
+        m = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*", t)
+        if m and int(m[1]) < 24 and int(m[2]) < 60:
+            out.append(f"{int(m[1]):02d}:{m[2]}")
+    return sorted(set(out))[:6]
+
+
+def pick_auto_product():
+    """The product that has waited longest since it was last posted, never the one posted just before."""
+    last = setting("auto_last_pid")
+    rows = db().execute("""SELECT p.*, (SELECT MAX(created_at) FROM social_posts s WHERE s.product_id=p.id AND s.status='ok') AS lp
+                           FROM products p WHERE p.active=1 ORDER BY (lp IS NOT NULL), lp, p.rowid DESC""").fetchall()
+    elig = [r for r in rows if share_photos(r["id"])]
+    nxt = [r for r in elig if r["id"] != last]
+    return (nxt or elig or [None])[0]
+
+
+def run_auto_post(slot_label="", force=False, reel=False):
+    """Post the next product now (as a Reel when asked). Returns (product or None, messages)."""
+    rdy = social_ready()
+    want = [pl for pl in ("fb", "ig") if setting("auto_" + pl, "1") == "1" and rdy[pl]]
+    if not want:
+        return None, ["Auto-post: connect Facebook or Instagram first."]
+    if not site_base():
+        return None, ["Auto-post: the app address is unknown. Set SITE_URL in Railway or open the Share page once."]
+    p = pick_auto_product()
+    if not p:
+        return None, ["Auto-post: no active product with a photo."]
+    picked = share_photos(p["id"])
+    msgs = None
+    if reel:
+        try:
+            msgs = do_reel(p, make_reel(p), want, auto=1)
+        except Exception as e:                    # no video tool, no photo, ...: still post the photos so the slot is not lost
+            msgs = [f"ℹ️ Reel not possible ({e}). Posted the photos instead."] + do_share(p, picked, want, auto=1)
+    if msgs is None:
+        msgs = do_share(p, picked, want, auto=1)
+    set_setting("auto_last_pid", p["id"])
+    ok = [m for m in msgs if m.startswith("✅")]
+    bad = [m for m in msgs if m.startswith("❌")]
+    title = ("🤖 Auto-posted: " if ok else "⚠️ Auto-post failed: ") + p["name"]
+    body = " · ".join(m for m in msgs if not m.startswith("ℹ️") or "Reel not possible" in m)
+    push_admins(title, body[:180], url="/admin/share", tag="autopost")
+    return p, msgs
+
+
+def auto_tick(flask_app, now=None):
+    """Called every minute: run any slot that is due, was not already covered by a manual post, and not yet done today."""
+    with flask_app.app_context():
+        try:
+            if setting("auto_on", "0") != "1":
+                return []
+            now = now or datetime.now(LAGOS)
+            ran = []
+            for t in auto_times():
+                h, m = map(int, t.split(":"))
+                slot = now.replace(hour=h, minute=m, second=0, microsecond=0)
+                key = f"auto_done_{slot:%Y-%m-%d}_{t}"
+                if not (slot <= now < slot + timedelta(minutes=AUTO_GRACE_MIN)) or setting(key):
+                    continue
+                set_setting(key, "1")                                   # claim first so it can never fire twice
+                cutoff = (slot - timedelta(minutes=AUTO_QUIET_BEFORE)).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                if db().execute("SELECT 1 FROM social_posts WHERE status='ok' AND created_at>=?", (cutoff,)).fetchone():
+                    ran.append((t, "skipped"))
+                    continue
+                is_last = t == auto_times()[-1]
+                p, msgs = run_auto_post(t, reel=(setting("auto_reel", "0") == "1" and is_last))
+                ran.append((t, p["id"] if p else "none"))
+            return ran
+        except Exception:
+            return []
+        finally:
+            try:
+                db().close()
+            except Exception:
+                pass
+
+
+def start_autopost(flask_app):
+    try:                                          # a restart kills running jobs: say so instead of showing "sending" forever
+        c = sqlite3.connect(CFG["DB"])
+        c.execute("UPDATE share_jobs SET status='failed', result=?, finished_at=CURRENT_TIMESTAMP WHERE status IN ('queued','working')",
+                  (json.dumps(["❌ The app restarted while sending. Please tap Post again."]),))
+        c.commit()
+        c.close()
+    except Exception:
+        pass
+
+    def loop():
+        while True:
+            time.sleep(60)
+            auto_tick(flask_app)
+    threading.Thread(target=loop, daemon=True, name="autopost").start()
+
+
+@bp.post("/admin/share/auto")
+@admin_required
+def admin_share_auto():
+    on = "1" if request.form.get("auto_on") else "0"
+    times = [request.form.get(f"t{i}", "").strip() for i in (1, 2, 3)]
+    good = [t for t in times if re.fullmatch(r"\d{1,2}:\d{2}", t)]
+    set_setting("auto_times", ",".join(good) or AUTO_DEFAULT_TIMES)
+    set_setting("auto_fb", "1" if request.form.get("auto_fb") else "0")
+    set_setting("auto_ig", "1" if request.form.get("auto_ig") else "0")
+    set_setting("auto_reel", "1" if request.form.get("auto_reel") else "0")
+    set_setting("auto_on", on)
+    if on == "1":                                  # do not fire slots that already passed today
+        now = datetime.now(LAGOS)
+        for t in auto_times():
+            h, m = map(int, t.split(":"))
+            if now.replace(hour=h, minute=m, second=0, microsecond=0) <= now:
+                set_setting(f"auto_done_{now:%Y-%m-%d}_{t}", "1")
+    flash("Auto-posting is ON. " + " · ".join(auto_times()) if on == "1" else "Auto-posting is OFF.")
+    return redirect(url_for("web.admin_share"))
+
+
+@bp.post("/admin/share/auto/run")
+@admin_required
+def admin_share_auto_run():
+    if queue_job("next") is None:
+        flash("A post is already being sent. Please wait a moment.")
+    else:
+        flash("📤 Sending the next product in the background. You can leave the app.")
+    return redirect(url_for("web.admin_share"))
+
+
 @bp.get("/admin/share")
 @admin_required
 def admin_share():
     refresh_ig_token()
     refresh_page_info(force=bool(request.args.get("refresh")))
+    _jobs = recent_jobs()
+    if not os.environ.get("SITE_URL"):
+        set_setting("site_seen", request.host_url.rstrip("/"))
     rdy = social_ready()
     prods = db().execute("""SELECT p.*, (SELECT MAX(created_at) FROM social_posts s WHERE s.product_id=p.id AND s.status='ok') AS last_post
                             FROM products p WHERE p.active=1 ORDER BY (p.added_at IS NULL), p.added_at DESC, p.rowid DESC""").fetchall()
@@ -3261,14 +3523,32 @@ def admin_share():
 {% else %}<p class="small">Connected:
 {% if rdy.fb %}<span class="tag g">Facebook · {{ fb_name }}</span>{% endif %} {% if rdy.ig %}<span class="tag g">Instagram · @{{ ig_name }}</span>{% endif %}
 · <a href="{{ url_for('web.admin_share', refresh=1) }}">↻ Refresh names</a> · <a href="{{ url_for('web.admin_share_connect') }}">Reconnect</a></p>{% endif %}
+{% if jobs %}<div class="card" style="padding:12px;margin-bottom:12px" id="jobs"><b>📤 Sending</b>
+{% for j in jobs %}<div class="small" style="margin-top:6px"><b>{{ j['name'] }}</b>{% if j['kind']=='reel' %} 🎬{% endif %} · {{ j['at'] }}
+{% if j['status'] in ('queued','working') %}<span style="color:#b26a00">⏳ sending…</span>{% elif j['status']=='done' %}<span style="color:#2a8a4a">✅ sent</span>{% elif j['status']=='partial' %}<span style="color:#b26a00">⚠️ partly sent</span>{% else %}<span style="color:#c0392b">❌ not sent</span>{% endif %}
+{% for m in j['msgs'] %}<div class="mut">{{ m }}</div>{% endfor %}</div>{% endfor %}</div>
+{% if busy %}<script>setTimeout(function(){location.reload()},4000);</script>{% endif %}{% endif %}
+{% if rdy.fb or rdy.ig %}<form method="post" action="{{ url_for('web.admin_share_auto') }}" class="card" style="padding:14px;margin-bottom:12px"><input type="hidden" name="csrf" value="{{ csrf }}">
+<div class="row between"><b>🤖 Auto-post</b><label class="small"><input type="checkbox" name="auto_on" value="1" {{ 'checked' if auto_on else '' }}> {{ 'ON' if auto_on else 'OFF' }}</label></div>
+<p class="mut small" style="margin:6px 0">At each time below, if you have not posted yourself, the app posts the product that has waited longest. Nigeria time.</p>
+<div class="row" style="gap:8px;flex-wrap:nowrap">{% for t in times %}<input type="time" name="t{{ loop.index }}" value="{{ t }}" style="min-width:0">{% endfor %}</div>
+<div class="small" style="margin:8px 0">{% if rdy.fb %}<label><input type="checkbox" name="auto_fb" value="1" {{ 'checked' if af else '' }}> Facebook</label> {% endif %}{% if rdy.ig %}<label style="margin-left:10px"><input type="checkbox" name="auto_ig" value="1" {{ 'checked' if ai else '' }}> Instagram</label>{% endif %}</div>
+<label class="small" style="display:block;margin-bottom:8px"><input type="checkbox" name="auto_reel" value="1" {{ 'checked' if ar else '' }}> 🎬 Make the last post of the day a Reel (video with music)</label>
+<div class="row"><button class="btn gold sm">Save</button>{% if nxt %}<a class="btn alt sm" href="{{ url_for('web.admin_share_reel', pid=nxt['id']) }}">🎬 Preview a Reel</a>{% endif %}</div></form>
+<form method="post" action="{{ url_for('web.admin_share_auto_run') }}" style="margin:-4px 0 12px"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn alt sm">▶ Post the next product now</button></form>{% endif %}
 <p class="mut small">Tap a product. The picture and caption are made for you automatically. Just press Post.</p>
-{% for p in prods %}<a class="card" href="{{ url_for('web.admin_share_product', pid=p['id']) }}" style="display:flex;gap:12px;align-items:center;padding:10px;margin-bottom:8px;text-decoration:none;color:inherit">
-{% if p['photo_file_id'] %}<img src="{{ url_for('web.img', fid=p['photo_file_id']) }}" alt="" style="width:64px;height:64px;object-fit:cover;border-radius:10px">{% endif %}
-<div class="grow"><b>{{ p['name'] }}</b><div class="small mut">{{ display_price(p) }}</div>
-{% if p['last_post'] %}<div class="small" style="color:#2a8a4a">✓ Posted {{ p['last_post'][:10] }}</div>{% endif %}</div><span class="btn alt sm">Share ›</span></a>{% endfor %}
+{% for p in prods %}<div class="card" style="display:flex;gap:10px;align-items:center;padding:10px;margin-bottom:8px">
+<a href="{{ url_for('web.admin_share_product', pid=p['id']) }}" style="display:flex;gap:12px;align-items:center;text-decoration:none;color:inherit;flex:1;min-width:0">
+{% if p['photo_file_id'] %}<img src="{{ url_for('web.img', fid=p['photo_file_id']) }}" alt="" style="width:64px;height:64px;object-fit:cover;border-radius:10px;flex:none">{% endif %}
+<div class="grow" style="min-width:0"><b>{{ p['name'] }}</b><div class="small mut">{{ display_price(p) }}</div>
+{% if p['last_post'] %}<div class="small" style="color:#2a8a4a">✓ Posted {{ p['last_post'][:10] }}</div>{% endif %}</div><span class="btn alt sm">Share ›</span></a>
+<a class="btn gold sm" href="{{ url_for('web.admin_share_reel', pid=p['id']) }}" title="Post as a Reel">🎬</a></div>{% endfor %}
 {% if recent %}<h3 style="margin-top:18px">Recent posts</h3>{% for r in recent %}<div class="small" style="margin-bottom:4px">
-{{ '✅' if r['status']=='ok' else '❌' }} {{ r['platform']|title }} · {{ r['name'] or r['product_id'] }} · {{ r['created_at'][:16] }}{% if r['error'] %}<div class="mut">{{ r['error'] }}</div>{% endif %}</div>{% endfor %}{% endif %}""",
-                      rdy=rdy, prods=prods, recent=recent, fb_name=setting("meta_page_name"), ig_name=setting("meta_ig_name"))
+{{ '✅' if r['status']=='ok' else '❌' }} {{ r['platform']|title }}{% if r['auto'] %} 🤖{% endif %} · {{ r['name'] or r['product_id'] }} · {{ r['created_at'][:16] }}{% if r['error'] %}<div class="mut">{{ r['error'] }}</div>{% endif %}</div>{% endfor %}{% endif %}""",
+                      rdy=rdy, prods=prods, recent=recent, fb_name=setting("meta_page_name"), ig_name=setting("meta_ig_name"),
+                      auto_on=setting("auto_on", "0") == "1", af=setting("auto_fb", "1") == "1", ai=setting("auto_ig", "1") == "1",
+                      times=(auto_times() + ["", "", ""])[:3], ar=setting("auto_reel", "0") == "1", nxt=pick_auto_product(),
+                      jobs=_jobs, busy=any(j["status"] in ("queued", "working") for j in _jobs))
 
 
 @bp.route("/admin/share/<pid>", methods=["GET", "POST"])
@@ -3285,31 +3565,16 @@ def admin_share_product(pid):
         if not picked:
             flash("This product has no picture selected. Add or tick at least one photo.")
             return redirect(url_for("web.admin_share_product", pid=pid))
-        done = []
-        for plat, fn, ok in (("fb", post_facebook, rdy["fb"]), ("ig", post_instagram, rdy["ig"])):
-            if not request.form.get("do_" + plat) or not ok:
-                continue
-            label = "Facebook" if plat == "fb" else "Instagram"
-            caption = request.form.get("cap_" + plat, "").strip()
-            if not caption:
-                caption = fresh_caption(p, plat)
-            elif _norm(caption) in used_captions(pid, label):
-                caption = fresh_caption(p, plat)
-                done.append(f"ℹ️ That {label} caption was used before, so a new one was written.")
-            caption = caption[:2100]
-            urls = [pub_img_url(f, fit=(plat == "ig" and len(picked) > 1)) for f in picked]
-            try:
-                rid = fn(urls, caption)
-                db().execute("INSERT INTO social_posts(product_id,platform,status,remote_id,caption) VALUES(?,?,?,?,?)",
-                             (pid, label, "ok", str(rid), caption))
-                done.append(f"✅ Posted to {label}" + (f" ({len(picked)} photos)" if len(picked) > 1 else ""))
-            except Exception as e:
-                db().execute("INSERT INTO social_posts(product_id,platform,status,error) VALUES(?,?,?,?)", (pid, label, "failed", str(e)[:300]))
-                done.append(f"❌ {label} failed: {e}")
-            db().commit()
-        for m in done or ["Choose Facebook or Instagram first."]:
-            flash(m)
-        return redirect(url_for("web.admin_share_product", pid=pid))
+        want = [pl for pl in ("fb", "ig") if request.form.get("do_" + pl)]
+        caps = {pl: request.form.get("cap_" + pl, "").strip() for pl in ("fb", "ig")}
+        if not want:
+            flash("Choose Facebook or Instagram first.")
+            return redirect(url_for("web.admin_share_product", pid=pid))
+        if queue_job("photo", pid, want, picked, caps) is None:
+            flash("This product is already being sent. Please wait a moment.")
+        else:
+            flash("📤 Sending in the background. You can leave this page or the app. We will notify you when it is done.")
+        return redirect(url_for("web.admin_share"))
     shuffle = to_int(request.args.get("n"), 0) or 0
     last = db().execute("SELECT MAX(created_at) FROM social_posts WHERE product_id=? AND status='ok'", (pid,)).fetchone()[0]
     return admin_page("Share " + p["name"], """<p><a href="{{ url_for('web.admin_share') }}">‹ All products</a></p>
@@ -3326,7 +3591,8 @@ def admin_share_product(pid):
 <label class="l" style="margin-top:10px"><input type="checkbox" name="do_ig" value="1" {{ 'checked' if rdy.ig else 'disabled' }}> Instagram {{ '' if rdy.ig else '(not connected)' }}</label>
 <textarea name="cap_ig" rows="9">{{ cap_ig }}</textarea>
 <div class="row" style="margin-top:10px"><button class="btn gold">📣 Post now</button>
-<a class="btn alt" href="{{ url_for('web.admin_share_product', pid=p['id'], n=shuffle+1) }}">🔄 New caption</a></div>
+<a class="btn alt" href="{{ url_for('web.admin_share_product', pid=p['id'], n=shuffle+1) }}">🔄 New caption</a>
+<a class="btn alt" href="{{ url_for('web.admin_share_reel', pid=p['id']) }}">🎬 As a Reel</a></div>
 <p class="mut small">The caption was written for you. You can leave it as it is, or change anything before posting.</p></form>""",
                       p=p, rdy=rdy, last=last, shuffle=shuffle, photos=allphotos,
                       cap_fb=fresh_caption(p, "fb", shuffle), cap_ig=fresh_caption(p, "ig", shuffle))
@@ -3481,7 +3747,6 @@ def not_found(_e):
 
 # ================================================================== registration into the bot's Flask app
 def register(flask_app, cfg):
-    from datetime import timedelta
     from werkzeug.middleware.proxy_fix import ProxyFix
     CFG.update(cfg)
     init_web_db()
@@ -3504,3 +3769,511 @@ def register(flask_app, cfg):
         SESSION_COOKIE_SECURE=bool(os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("SITE_URL")),
         PERMANENT_SESSION_LIFETIME=timedelta(days=365), MAX_CONTENT_LENGTH=40 * 1024 * 1024)
     flask_app.register_blueprint(bp)
+    start_autopost(flask_app)
+
+
+# ================================================================== REELS (video + music, made by the app itself)
+# A short vertical video (9:16) of the product: intro card, every photo with a slow zoom, an order card, and original
+# music written in code (so there are no copyright problems). Posted to Instagram Reels and the Facebook Page.
+REEL_W, REEL_H, REEL_FPS = 1080, 1920, 30
+REEL_GOLD, REEL_INK = (212, 169, 74), (13, 13, 13)
+MUSIC_SR = 44100
+
+
+class ReelError(RuntimeError):
+    pass
+
+
+def _ffmpeg():
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        pass
+    import shutil
+    return shutil.which("ffmpeg")
+
+
+def _reel_dir():
+    d = os.path.join(os.path.dirname(os.path.abspath(CFG["DB"])), "reels")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+# ---------------------------------------------------------------- music
+def _music_style(tone):
+    return {"modest": "soft", "fabric": "lively"}.get(tone, "bold" if tone in ("watch", "shoes", "caps", "eyewear", "accessory") else "lively")
+
+
+def make_music(style, seconds, seed, path):
+    """Write an original instrumental (WAV). Styles: soft (elegant), lively (afro groove), bold (modern beat)."""
+    import numpy as np
+    import random as _random
+    import wave
+    sr = MUSIC_SR
+    rnd = _random.Random(seed)
+    rng = np.random.default_rng(rnd.randrange(1 << 30))
+    n = int(sr * (seconds + 0.5))
+    melodic, drums = np.zeros(n), np.zeros(n)
+
+    def hz(m):
+        return 440.0 * 2 ** ((m - 69) / 12)
+
+    def put(buf, arr, at, gain=1.0):
+        i = int(at * sr)
+        if i >= n:
+            return
+        j = min(n, i + len(arr))
+        buf[i:j] += arr[: j - i] * gain
+
+    def tone(m, dur, kind):
+        t = np.arange(int(sr * dur)) / sr
+        f = hz(m)
+        if kind == "pluck":
+            w = np.sin(2 * np.pi * f * t) + 0.45 * np.sin(2 * np.pi * 2 * f * t) + 0.2 * np.sin(2 * np.pi * 3 * f * t)
+            env = np.exp(-t * 5.5) * np.minimum(1, t / 0.004)
+        elif kind == "bell":
+            w = np.sin(2 * np.pi * f * t) + 0.35 * np.sin(2 * np.pi * 2.76 * f * t) + 0.15 * np.sin(2 * np.pi * 5.4 * f * t)
+            env = np.exp(-t * 3.2) * np.minimum(1, t / 0.003)
+        elif kind == "pad":
+            w = sum(np.sin(2 * np.pi * f * (1 + d) * t) for d in (-0.003, 0, 0.003)) / 3 + 0.25 * np.sin(2 * np.pi * 2 * f * t)
+            env = np.minimum(1, t / 0.4) * np.minimum(1, np.maximum(0, (dur - t)) / 0.4)
+        elif kind == "bass":
+            w = np.sin(2 * np.pi * f * t) + 0.35 * np.sin(2 * np.pi * 2 * f * t) + 0.12 * np.sin(2 * np.pi * 3 * f * t)
+            env = np.exp(-t * 3.0) * np.minimum(1, t / 0.01)
+        else:  # "sub": 808 with a quick pitch drop, saturated so small phone speakers can hear it
+            ff = f * (1 + 1.2 * np.exp(-t * 28))
+            w = np.tanh(2.2 * np.sin(2 * np.pi * np.cumsum(ff) / sr))
+            env = np.exp(-t * 2.0) * np.minimum(1, t / 0.003)
+        return w * env
+
+    def kick():
+        t = np.arange(int(sr * 0.32)) / sr
+        return np.sin(2 * np.pi * np.cumsum(48 + 120 * np.exp(-t * 32)) / sr) * np.exp(-t * 9)
+
+    def hat(d=0.05):
+        t = np.arange(int(sr * d)) / sr
+        x = rng.standard_normal(len(t))
+        return (x - np.convolve(x, np.ones(6) / 6, "same")) * np.exp(-t * 80)
+
+    def clap():
+        t = np.arange(int(sr * 0.22)) / sr
+        x = rng.standard_normal(len(t))
+        x = np.convolve(x, np.ones(3) / 3, "same")
+        env = np.exp(-t * 22) + 0.7 * np.exp(-np.maximum(0, t - 0.012) * 40) * (t > 0.012) + 0.5 * np.exp(-np.maximum(0, t - 0.024) * 40) * (t > 0.024)
+        return x * env
+
+    def snare():
+        t = np.arange(int(sr * 0.2)) / sr
+        return (rng.standard_normal(len(t)) * 0.7 + np.sin(2 * np.pi * 185 * t) * 0.5) * np.exp(-t * 20)
+
+    if style == "soft":
+        bpm, prog = 76, [("Am", [57, 60, 64]), ("F", [53, 57, 60]), ("C", [60, 64, 67]), ("G", [55, 59, 62])]
+    elif style == "lively":
+        bpm, prog = 104, [("Dm", [50, 53, 57]), ("Bb", [46, 50, 53]), ("F", [53, 57, 60]), ("C", [48, 52, 55])]
+    else:
+        bpm, prog = 92, [("Am", [57, 60, 64]), ("F", [53, 57, 60]), ("C", [60, 64, 67]), ("G", [55, 59, 62])]
+    step = 60.0 / bpm / 4
+    bar = step * 16
+    bars = int(seconds / bar) + 1
+    penta = [69, 72, 74, 76, 79, 81]
+    for b in range(bars):
+        name, ch = prog[b % 4]
+        t0 = b * bar
+        if style == "soft":
+            for m in ch:
+                put(melodic, tone(m - 12, bar + 0.4, "pad"), t0, 0.16)
+            pat = [rnd.choice(ch) + 12 for _ in range(8)]
+            for k, m in enumerate(pat):
+                put(melodic, tone(m + (12 if rnd.random() < 0.25 else 0), 1.2, "bell" if k % 4 == 0 else "pluck"), t0 + k * 2 * step, 0.30)
+            for s_ in (0, 8):
+                put(drums, kick(), t0 + s_ * step, 0.45)
+            for s_ in (4, 12):
+                put(drums, hat(0.09), t0 + s_ * step, 0.22)
+            for s_ in range(0, 16, 2):
+                put(drums, hat(), t0 + s_ * step, 0.07)
+        elif style == "lively":
+            root = ch[0] - 12
+            for s_ in (0, 6, 10):
+                put(drums, kick(), t0 + s_ * step, 0.6)
+            for s_ in (4, 12):
+                put(drums, clap(), t0 + s_ * step, 0.45)
+            for s_ in range(16):
+                put(drums, hat(0.04 if s_ % 2 else 0.06), t0 + s_ * step, 0.16 if s_ % 4 == 0 else 0.09)
+            for s_ in (0, 3, 6, 10, 13):
+                put(melodic, tone(root, step * 3, "bass"), t0 + s_ * step, 0.55)
+            for s_ in (2, 7, 10, 14):
+                for m in ch:
+                    put(melodic, tone(m + 12, 0.5, "pluck"), t0 + s_ * step, 0.12)
+            for s_ in sorted(rnd.sample(range(16), 5)):
+                put(melodic, tone(rnd.choice(ch) + 24, 0.5, "bell"), t0 + s_ * step, 0.11)
+        else:
+            root = ch[0] - 24
+            for s_ in (0, 7, 10):
+                put(drums, kick(), t0 + s_ * step, 0.55)
+            put(drums, clap(), t0 + 8 * step, 0.5)
+            for s_ in range(16):
+                if rnd.random() < 0.9:
+                    put(drums, hat(0.035), t0 + s_ * step, 0.14 if s_ % 2 == 0 else 0.07)
+            for s_ in (0, 10):
+                put(melodic, tone(root + 12, step * 8, "sub"), t0 + s_ * step, 0.62)
+            for s_ in sorted(rnd.sample(range(16), 6)):
+                put(melodic, tone(rnd.choice(penta), 0.6, "pluck"), t0 + s_ * step, 0.22)
+            for m in ch:
+                put(melodic, tone(m, bar, "pad"), t0, 0.07)
+    # a little room reverb on the melodic part
+    ir = rng.standard_normal(int(sr * 0.8)) * np.exp(-np.arange(int(sr * 0.8)) / (sr * 0.2))
+    size = 1 << (n + len(ir)).bit_length()
+    wet = np.fft.irfft(np.fft.rfft(melodic, size) * np.fft.rfft(ir, size), size)[:n]
+    wet *= (np.abs(melodic).max() / (np.abs(wet).max() or 1)) * 0.5
+    mix = melodic + wet + drums
+    mix = np.tanh(mix * 1.1)
+    mix /= (np.abs(mix).max() or 1) / 0.9
+    fin, fout = int(sr * 0.25), int(sr * 1.6)
+    mix[:fin] *= np.linspace(0, 1, fin)
+    mix[-fout:] *= np.linspace(1, 0, fout)
+    pcm = (mix * 32767).astype(np.int16)
+    with wave.open(path, "wb") as w:
+        w.setnchannels(2)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes(np.repeat(pcm[:, None], 2, axis=1).tobytes())
+    return path
+
+
+# ---------------------------------------------------------------- picture scenes
+def _reel_text(s):
+    return re.sub(r"[^\w\s&'’.,\-+/()%₦:!@#]", "", s or "").strip()
+
+
+def _glyph_ok(font, ch="₦"):
+    try:
+        return font.getmask(ch).getbbox() != font.getmask("￿").getbbox()
+    except Exception:
+        return False
+
+
+def _price_text(font, s):
+    return s if _glyph_ok(font) else s.replace("₦", "NGN ")
+
+
+def _fit_cover(im, w, h):
+    sc = max(w / im.width, h / im.height)
+    im = im.resize((max(w, int(im.width * sc + .5)), max(h, int(im.height * sc + .5))))
+    l, t = (im.width - w) // 2, (im.height - h) // 2
+    return im.crop((l, t, l + w, t + h))
+
+
+def _fit_inside(im, w, h):
+    sc = min(w / im.width, h / im.height)
+    return im.resize((max(1, int(im.width * sc)), max(1, int(im.height * sc))))
+
+
+def _wrap(draw, text, font, maxw, lines=2):
+    words, out, cur = text.split(), [], ""
+    for wd in words:
+        t = (cur + " " + wd).strip()
+        if draw.textlength(t, font=font) <= maxw or not cur:
+            cur = t
+        else:
+            out.append(cur)
+            cur = wd
+    out.append(cur)
+    if len(out) > lines:
+        out = out[:lines]
+        out[-1] = out[-1].rstrip(".,") + "…"
+    return out
+
+
+def _reel_logo(size):
+    from PIL import Image, ImageDraw
+    lg = _logo_image()
+    if lg is None:
+        return None
+    lg = _fit_cover(lg.convert("RGB"), size, size)
+    m = Image.new("L", (size, size), 0)
+    ImageDraw.Draw(m).ellipse((0, 0, size - 1, size - 1), fill=255)
+    out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    out.paste(lg, (0, 0), m)
+    return out
+
+
+def _centered(draw, text, font, y, fill, W=REEL_W):
+    draw.text(((W - draw.textlength(text, font=font)) / 2, y), text, font=font, fill=fill)
+
+
+def _gradient():
+    from PIL import Image
+    top, bot = (24, 20, 14), (6, 6, 6)
+    col = Image.new("RGB", (1, REEL_H))
+    col.putdata([tuple(int(top[i] + (bot[i] - top[i]) * y / REEL_H) for i in range(3)) for y in range(REEL_H)])
+    return col.resize((REEL_W, REEL_H))
+
+
+def _fit_font(draw, text, size, maxw=880):
+    while size > 30:
+        f = _font(size)
+        if draw.textlength(_price_text(f, text), font=f) <= maxw:
+            return f
+        size -= 4
+    return _font(30)
+
+
+def _pill(draw, text, font, cx, y, pad=36):
+    text = _price_text(font, text)
+    w = draw.textlength(text, font=font)
+    h = font.size + 30
+    draw.rounded_rectangle((cx - w / 2 - pad, y, cx + w / 2 + pad, y + h), radius=h // 2, fill=REEL_GOLD)
+    draw.text((cx - w / 2, y + 12), text, font=font, fill=REEL_INK)
+    return y + h
+
+
+def _scene_photo(photo_path, name, price):
+    from PIL import Image, ImageDraw, ImageFilter
+    im = Image.open(photo_path).convert("RGB")
+    bg = _fit_cover(im, REEL_W, REEL_H).filter(ImageFilter.GaussianBlur(40))
+    bg = Image.blend(bg, Image.new("RGB", (REEL_W, REEL_H), REEL_INK), 0.58)
+    fg = _fit_inside(im, 960, 1260)
+    msk = Image.new("L", fg.size, 0)
+    ImageDraw.Draw(msk).rounded_rectangle((0, 0, fg.width - 1, fg.height - 1), radius=36, fill=255)
+    x, y = (REEL_W - fg.width) // 2, 250 + (1260 - fg.height) // 2
+    sh = Image.new("RGBA", (REEL_W, REEL_H), (0, 0, 0, 0))
+    ImageDraw.Draw(sh).rounded_rectangle((x, y + 18, x + fg.width, y + fg.height + 18), radius=36, fill=(0, 0, 0, 150))
+    bg = Image.alpha_composite(bg.convert("RGBA"), sh.filter(ImageFilter.GaussianBlur(26))).convert("RGB")
+    bg.paste(fg, (x, y), msk)
+    d = ImageDraw.Draw(bg)
+    lg = _reel_logo(104)
+    if lg:
+        bg.paste(lg, (56, 70), lg)
+    d.text((184, 96), "AD FASHION SHOP", font=_font(44), fill=REEL_GOLD)
+    fn, fp = _font(60), _fit_font(d, price, 62)
+    yy = 1560
+    for ln in _wrap(d, name, fn, 960):
+        _centered(d, ln, fn, yy, (255, 255, 255))
+        yy += 74
+    if price:
+        _pill(d, price, fp, REEL_W / 2, min(yy + 14, 1760))
+    return bg
+
+
+def _scene_intro():
+    from PIL import ImageDraw
+    bg = _gradient()
+    d = ImageDraw.Draw(bg)
+    lg = _reel_logo(520)
+    if lg:
+        d.ellipse((REEL_W / 2 - 280, 520, REEL_W / 2 + 280, 1080), outline=REEL_GOLD, width=8)
+        bg.paste(lg, ((REEL_W - 520) // 2, 540), lg)
+    _centered(d, "AD FASHION SHOP", _font(86), 1180, REEL_GOLD)
+    _centered(d, "HIJABS  &  MORE", _font(46), 1310, (235, 235, 235))
+    return bg
+
+
+def _scene_outro(first_photo, name, price, site_txt, wa):
+    from PIL import Image, ImageDraw
+    bg = _gradient()
+    d = ImageDraw.Draw(bg)
+    try:
+        im = Image.open(first_photo).convert("RGB")
+        card = _fit_cover(im, 640, 640)
+        msk = Image.new("L", (640, 640), 0)
+        ImageDraw.Draw(msk).rounded_rectangle((0, 0, 639, 639), radius=40, fill=255)
+        bg.paste(card, ((REEL_W - 640) // 2, 260), msk)
+    except Exception:
+        pass
+    _centered(d, "ORDER NOW", _font(120), 1010, REEL_GOLD)
+    fn, fp = _font(58), _fit_font(d, price, 60)
+    yy = 1175
+    for ln in _wrap(d, name, fn, 960):
+        _centered(d, ln, fn, yy, (255, 255, 255))
+        yy += 70
+    if price:
+        yy = _pill(d, price, fp, REEL_W / 2, yy + 10)
+    f2 = _font(44, bold=False)
+    _centered(d, "Tap the link in our bio", f2, yy + 50, (235, 235, 235))
+    if wa:
+        _centered(d, f"WhatsApp {wa}", f2, yy + 112, (235, 235, 235))
+    _centered(d, "Bauchi, Nigeria  |  Delivery nationwide", _font(36, bold=False), 1790, (170, 170, 170))
+    return bg
+
+
+# ---------------------------------------------------------------- put it together with ffmpeg
+def make_reel(p, take=0):
+    """Build (or reuse) the Reel for a product. Returns the MP4 path."""
+    import subprocess
+    ff = _ffmpeg()
+    if not ff:
+        raise ReelError("The video tool (FFmpeg) is not installed on the server.")
+    fids = share_photos(p["id"])[:6]
+    paths = [x for x in (fetch_file(f) for f in fids) if x]
+    if not paths:
+        raise ReelError("This product has no picture to make a video from.")
+    name = _reel_text(p["name"]) or "New arrival"
+    price = display_price(p) if (p["price"] or fabric_prices(p["id"])) else ""
+    price = re.sub(r"\s+", " ", price.replace("from ", "From "))
+    wa = CFG.get("WHATSAPP", "")
+    tone = tone_of(p)
+    key = hashlib.sha256("|".join([p["id"], name, price, ",".join(fids), str(take), setting("web_logo"), wa,
+                                    time.strftime("%Y-%m-%d")]).encode()).hexdigest()[:12]
+    out = os.path.join(_reel_dir(), f"{re.sub(r'[^A-Za-z0-9]', '', p['id'])[:20] or 'p'}_{key}.mp4")
+    if os.path.exists(out) and os.path.getsize(out) > 10000:
+        return out
+    work = os.path.join(_reel_dir(), "tmp_" + key)
+    os.makedirs(work, exist_ok=True)
+    try:
+        scenes = [(_scene_intro(), 1.6)]
+        for pth in paths:
+            scenes.append((_scene_photo(pth, name, price), 3.0 if len(paths) > 1 else 5.0))
+        scenes.append((_scene_outro(paths[0], name, price, site_base(), wa), 2.8))
+        files = []
+        for i, (im, _d) in enumerate(scenes):
+            f = os.path.join(work, f"s{i}.png")
+            im.save(f)
+            files.append(f)
+        T, durs = 0.4, [d for _i, d in scenes]
+        total = sum(durs)
+        seed = int(hashlib.sha256(f"{p['id']}-{take}-{time.strftime('%Y%m%d')}".encode()).hexdigest()[:8], 16)
+        wav = os.path.join(work, "music.wav")
+        make_music(_music_style(tone), total, seed, wav)
+        cmd, filt = [ff, "-y", "-loglevel", "error"], []
+        for f in files:
+            cmd += ["-i", f]
+        cmd += ["-i", wav]
+        for i, d in enumerate(durs):
+            frames = int(round((d + (T if i < len(durs) - 1 else 0)) * REEL_FPS))
+            z = ("min(zoom+0.0007,1.12)" if i % 2 == 0 else "if(eq(on,0),1.12,max(zoom-0.0007,1.0))")
+            filt.append(f"[{i}:v]scale=2160:3840:flags=bilinear,zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+                        f":d={frames}:s={REEL_W}x{REEL_H}:fps={REEL_FPS},setsar=1,format=yuv420p[v{i}]")
+        last, acc = "v0", 0.0
+        for i in range(1, len(durs)):
+            acc += durs[i - 1]
+            filt.append(f"[{last}][v{i}]xfade=transition=fade:duration={T}:offset={acc:.2f}[x{i}]")
+            last = f"x{i}"
+        cmd += ["-filter_complex", ";".join(filt), "-map", f"[{last}]", "-map", f"{len(files)}:a",
+                "-t", f"{total:.2f}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-profile:v", "high",
+                "-pix_fmt", "yuv420p", "-r", str(REEL_FPS), "-g", "60", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+                "-movflags", "+faststart", out]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if r.returncode != 0 or not os.path.exists(out):
+            raise ReelError("Video maker error: " + (r.stderr or "unknown")[-300:])
+    finally:
+        import shutil
+        shutil.rmtree(work, ignore_errors=True)
+    for old in sorted((os.path.join(_reel_dir(), x) for x in os.listdir(_reel_dir()) if x.endswith(".mp4")),
+                      key=os.path.getmtime)[:-12]:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    return out
+
+
+def _vid_sig(name):
+    return _pub_sig("reel/" + name)
+
+
+def pub_vid_url(path):
+    n = os.path.basename(path)
+    return f"{site_base()}/pubvid/{_vid_sig(n)}/{n}"
+
+
+@bp.get("/pubvid/<sig>/<name>")
+def pubvid(sig, name):
+    """Public (signed) video link. Instagram and Facebook download the Reel from here."""
+    import hmac
+    if not re.fullmatch(r"[A-Za-z0-9_\-]+\.mp4", name) or not hmac.compare_digest(sig, _vid_sig(name)):
+        abort(404)
+    path = os.path.join(_reel_dir(), name)
+    if not os.path.exists(path):
+        abort(404)
+    return send_file(path, mimetype="video/mp4", conditional=True, max_age=3600)
+
+
+@bp.get("/admin/reelfile/<name>")
+@admin_required
+def admin_reelfile(name):
+    path = os.path.join(_reel_dir(), name)
+    if not re.fullmatch(r"[A-Za-z0-9_\-]+\.mp4", name) or not os.path.exists(path):
+        abort(404)
+    return send_file(path, mimetype="video/mp4", conditional=True, max_age=300)
+
+
+# ---------------------------------------------------------------- posting a Reel
+def post_instagram_reel(video_url, caption):
+    base, tok = _ig_target()
+    ig = setting("meta_ig_id")
+    cid = _graph("POST", f"/{ig}/media", {"media_type": "REELS", "video_url": video_url, "caption": caption,
+                                           "share_to_feed": "true", "access_token": tok}, base=base)["id"]
+    _ig_wait(cid, tok, base, tries=70, pause=3)                 # Instagram needs a little while to process a video
+    return _graph("POST", f"/{ig}/media_publish", {"creation_id": cid, "access_token": tok}, base=base).get("id", "")
+
+
+def post_facebook_reel(video_url, caption):
+    page, tok = setting("meta_fb_page_id"), setting("meta_page_token")
+    try:
+        s = _graph("POST", f"/{page}/video_reels", {"upload_phase": "start", "access_token": tok})
+        req = urllib.request.Request(s["upload_url"], data=b"", method="POST",
+                                     headers={"Authorization": "OAuth " + tok, "file_url": video_url})
+        urllib.request.urlopen(req, timeout=120).read()
+        _graph("POST", f"/{page}/video_reels", {"upload_phase": "finish", "video_id": s["video_id"],
+                                                 "video_state": "PUBLISHED", "description": caption, "access_token": tok})
+        return s["video_id"]
+    except Exception:
+        # Fall back to an ordinary Facebook video if the Reel route is refused.
+        return _graph("POST", f"/{page}/videos", {"file_url": video_url, "description": caption, "access_token": tok}).get("id", "")
+
+
+def do_reel(p, path, want, caps=None, auto=0):
+    rdy, caps, out, pid = social_ready(), caps or {}, [], p["id"]
+    url = pub_vid_url(path)
+    for plat, fn in (("fb", post_facebook_reel), ("ig", post_instagram_reel)):
+        if plat not in want or not rdy[plat]:
+            continue
+        label = "Facebook" if plat == "fb" else "Instagram"
+        caption = (caps.get(plat) or "").strip()
+        if not caption or _norm(caption) in used_captions(pid, label):
+            caption = fresh_caption(p, plat)
+        try:
+            rid = fn(url, caption[:2100])
+            db().execute("INSERT INTO social_posts(product_id,platform,status,remote_id,caption,auto) VALUES(?,?,?,?,?,?)",
+                         (pid, label, "ok", str(rid), caption[:2100], auto))
+            out.append(f"✅ Posted Reel to {label}")
+        except Exception as e:
+            db().execute("INSERT INTO social_posts(product_id,platform,status,error,auto) VALUES(?,?,?,?,?)",
+                         (pid, label, "failed", ("Reel: " + str(e))[:300], auto))
+            out.append(f"❌ {label} Reel failed: {e}")
+        db().commit()
+    return out
+
+
+@bp.route("/admin/share/reel/<pid>", methods=["GET", "POST"])
+@admin_required
+def admin_share_reel(pid):
+    p = db().execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
+    if not p:
+        abort(404)
+    take = to_int(request.values.get("n"), 0) or 0
+    try:
+        path = make_reel(p, take)
+    except ReelError as e:
+        flash(f"Could not make the video: {e}")
+        return redirect(url_for("web.admin_share"))
+    if request.method == "POST":
+        rdy = social_ready()
+        want = [pl for pl in ("fb", "ig") if setting("auto_" + pl, "1") == "1" and rdy[pl]]
+        if not want:
+            flash("Connect Facebook or Instagram first.")
+        elif queue_job("reel", pid, want, take=take) is None:
+            flash("This Reel is already being sent. Please wait a moment.")
+        else:
+            flash("📤 Sending the Reel in the background. You can leave the app. We will notify you when it is done.")
+        return redirect(url_for("web.admin_share"))
+    name = os.path.basename(path)
+    return admin_page("Reel preview", """<p><a href="{{ url_for('web.admin_share') }}">‹ Share</a></p>
+<h2>🎬 Reel: {{ p['name'] }}</h2>
+<video src="{{ url_for('web.admin_reelfile', name=name) }}" controls playsinline preload="metadata" style="width:100%;max-width:340px;border-radius:14px;background:#000"></video>
+<p class="mut small">This is exactly what will be posted: photos, text and the music ({{ style }} style).</p>
+<form method="post" class="row" style="margin-top:10px"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="n" value="{{ take }}">
+<button class="btn gold">📣 Post this Reel now</button>
+<a class="btn alt" href="{{ url_for('web.admin_share_reel', pid=p['id'], n=take+1) }}">🔄 Another take (new music)</a></form>""",
+                      p=p, name=name, take=take, style=_music_style(tone_of(p)))
