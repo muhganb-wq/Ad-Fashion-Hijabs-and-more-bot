@@ -4119,15 +4119,49 @@ def _pill(draw, text, font, cx, y, pad=36):
     return y + h
 
 
-def _scene_photo(photo_path, name, price):
+def reel_prices(p):
+    """Every price of the product as (label, amount) rows: each fabric, or per yard / per trouser, or the single price."""
+    rows = []
+    for k, v in fabric_prices(p["id"]).items():
+        rows.append((FABRIC_NAME[k].replace(" Fabric", ""), money(v)))
+    if not rows and p["price"]:
+        rows = [("", money(p["price"]))]
+    return rows
+
+
+def _price_block(draw, rows, y, big=True):
+    """One gold pill for a single price, or a neat panel listing every price. Returns the bottom y."""
+    if not rows:
+        return y
+    if len(rows) == 1 and not rows[0][0]:
+        fp = _fit_font(draw, rows[0][1], 62 if big else 60)
+        return _pill(draw, rows[0][1], fp, REEL_W / 2, y)
+    fl, fa = _font(46, bold=False), _font(50)
+    rh, pad, W = 70, 26, 880
+    h = rh * len(rows) + pad * 2
+    x0 = (REEL_W - W) // 2
+    draw.rounded_rectangle((x0, y, x0 + W, y + h), radius=34, fill=(20, 17, 12), outline=REEL_GOLD, width=4)
+    for i, (lab, amt) in enumerate(rows):
+        ty = y + pad + i * rh
+        draw.text((x0 + 36, ty + 4), lab, font=fl, fill=(240, 240, 240))
+        t = _price_text(fa, amt)
+        draw.text((x0 + W - 36 - draw.textlength(t, font=fa), ty), t, font=fa, fill=REEL_GOLD)
+        if i < len(rows) - 1:
+            draw.line((x0 + 30, ty + rh - 4, x0 + W - 30, ty + rh - 4), fill=(70, 60, 40), width=2)
+    return y + h
+
+
+def _scene_photo(photo_path, name, rows):
     from PIL import Image, ImageDraw, ImageFilter
     im = Image.open(photo_path).convert("RGB")
     bg = _fit_cover(im, REEL_W, REEL_H).filter(ImageFilter.GaussianBlur(40))
     bg = Image.blend(bg, Image.new("RGB", (REEL_W, REEL_H), REEL_INK), 0.58)
-    fg = _fit_inside(im, 960, 1260)
+    multi = len(rows) > 1
+    box_h = 1010 if multi else 1260
+    fg = _fit_inside(im, 960, box_h)
     msk = Image.new("L", fg.size, 0)
     ImageDraw.Draw(msk).rounded_rectangle((0, 0, fg.width - 1, fg.height - 1), radius=36, fill=255)
-    x, y = (REEL_W - fg.width) // 2, 250 + (1260 - fg.height) // 2
+    x, y = (REEL_W - fg.width) // 2, 230 + (box_h - fg.height) // 2
     sh = Image.new("RGBA", (REEL_W, REEL_H), (0, 0, 0, 0))
     ImageDraw.Draw(sh).rounded_rectangle((x, y + 18, x + fg.width, y + fg.height + 18), radius=36, fill=(0, 0, 0, 150))
     bg = Image.alpha_composite(bg.convert("RGBA"), sh.filter(ImageFilter.GaussianBlur(26))).convert("RGB")
@@ -4137,13 +4171,12 @@ def _scene_photo(photo_path, name, price):
     if lg:
         bg.paste(lg, (56, 70), lg)
     d.text((184, 96), "AD FASHION SHOP", font=_font(44), fill=REEL_GOLD)
-    fn, fp = _font(60), _fit_font(d, price, 62)
-    yy = 1560
+    fn = _font(56 if multi else 60)
+    yy = 1270 if multi else 1560
     for ln in _wrap(d, name, fn, 960):
         _centered(d, ln, fn, yy, (255, 255, 255))
-        yy += 74
-    if price:
-        _pill(d, price, fp, REEL_W / 2, min(yy + 14, 1760))
+        yy += 70 if multi else 74
+    _price_block(d, rows, yy + 12 if multi else min(yy + 14, 1760))
     return bg
 
 
@@ -4160,30 +4193,31 @@ def _scene_intro():
     return bg
 
 
-def _scene_outro(first_photo, name, price, site_txt, wa):
+def _scene_outro(first_photo, name, rows, site_txt, wa):
     from PIL import Image, ImageDraw
     bg = _gradient()
     d = ImageDraw.Draw(bg)
     try:
         im = Image.open(first_photo).convert("RGB")
-        card = _fit_cover(im, 640, 640)
-        msk = Image.new("L", (640, 640), 0)
-        ImageDraw.Draw(msk).rounded_rectangle((0, 0, 639, 639), radius=40, fill=255)
-        bg.paste(card, ((REEL_W - 640) // 2, 260), msk)
+        sz = 520 if len(rows) > 1 else 640
+        card = _fit_cover(im, sz, sz)
+        msk = Image.new("L", (sz, sz), 0)
+        ImageDraw.Draw(msk).rounded_rectangle((0, 0, sz - 1, sz - 1), radius=40, fill=255)
+        bg.paste(card, ((REEL_W - sz) // 2, 200 if len(rows) > 1 else 260), msk)
     except Exception:
         pass
-    _centered(d, "ORDER NOW", _font(120), 1010, REEL_GOLD)
-    fn, fp = _font(58), _fit_font(d, price, 60)
-    yy = 1175
+    multi = len(rows) > 1
+    _centered(d, "ORDER NOW", _font(100 if multi else 120), 760 if multi else 1010, REEL_GOLD)
+    fn = _font(54 if multi else 58)
+    yy = 900 if multi else 1175
     for ln in _wrap(d, name, fn, 960):
         _centered(d, ln, fn, yy, (255, 255, 255))
-        yy += 70
-    if price:
-        yy = _pill(d, price, fp, REEL_W / 2, yy + 10)
-    f2 = _font(44, bold=False)
-    _centered(d, "Tap the link in our bio", f2, yy + 50, (235, 235, 235))
+        yy += 66 if multi else 70
+    yy = _price_block(d, rows, yy + 10, big=False)
+    f2 = _font(42 if multi else 44, bold=False)
+    _centered(d, "Tap the link in our bio", f2, yy + (36 if multi else 50), (235, 235, 235))
     if wa:
-        _centered(d, f"WhatsApp {wa}", f2, yy + 112, (235, 235, 235))
+        _centered(d, f"WhatsApp {wa}", f2, yy + (92 if multi else 112), (235, 235, 235))
     _centered(d, "Bauchi, Nigeria  |  Delivery nationwide", _font(36, bold=False), 1790, (170, 170, 170))
     return bg
 
@@ -4200,11 +4234,10 @@ def make_reel(p, take=0):
     if not paths:
         raise ReelError("This product has no picture to make a video from.")
     name = _reel_text(p["name"]) or "New arrival"
-    price = display_price(p) if (p["price"] or fabric_prices(p["id"])) else ""
-    price = re.sub(r"\s+", " ", price.replace("from ", "From "))
+    rows = reel_prices(p)
     wa = CFG.get("WHATSAPP", "")
     tone = tone_of(p)
-    key = hashlib.sha256("|".join([p["id"], name, price, ",".join(fids), str(take), setting("web_logo"), wa,
+    key = hashlib.sha256("|".join([p["id"], name, repr(rows), ",".join(fids), str(take), setting("web_logo"), wa,
                                     time.strftime("%Y-%m-%d")]).encode()).hexdigest()[:12]
     out = os.path.join(_reel_dir(), f"{re.sub(r'[^A-Za-z0-9]', '', p['id'])[:20] or 'p'}_{key}.mp4")
     if os.path.exists(out) and os.path.getsize(out) > 10000:
@@ -4216,8 +4249,8 @@ def make_reel(p, take=0):
         plan = [("intro", None, 1.6)] + [("photo", pth, 3.0 if len(paths) > 1 else 5.0) for pth in paths] + [("outro", paths[0], 2.8)]
         files, durs = [], []
         for i, (kind, pth, d) in enumerate(plan):          # one picture in memory at a time
-            im = (_scene_intro() if kind == "intro" else _scene_photo(pth, name, price) if kind == "photo"
-                  else _scene_outro(pth, name, price, site_base(), wa))
+            im = (_scene_intro() if kind == "intro" else _scene_photo(pth, name, rows) if kind == "photo"
+                  else _scene_outro(pth, name, rows, site_base(), wa))
             f = os.path.join(work, f"s{i}.png")
             im.save(f)
             im.close()
