@@ -3354,6 +3354,17 @@ def run_job(flask_app, jid):
                 pass
 
 
+def _job_sig():
+    r = db().execute("SELECT id, status FROM share_jobs ORDER BY id DESC LIMIT 1").fetchone()
+    return f"{r['id']}:{r['status']}" if r else "0"
+
+
+@bp.get("/admin/share/pulse")
+@admin_required
+def admin_share_pulse():
+    return {"sig": _job_sig()}
+
+
 def recent_jobs(limit=5):
     rows = db().execute("""SELECT j.*, p.name FROM share_jobs j LEFT JOIN products p ON p.id=j.product_id
                            WHERE j.created_at>=datetime('now','-1 day') ORDER BY j.id DESC LIMIT ?""", (limit,)).fetchall()
@@ -3443,7 +3454,15 @@ def auto_tick(flask_app, now=None):
                     ran.append((t, "skipped"))
                     continue
                 is_last = t == auto_times()[-1]
-                p, msgs = run_auto_post(t, reel=(setting("auto_reel", "0") == "1" and is_last))
+                reel = setting("auto_reel", "0") == "1" and is_last
+                jid = db().execute("INSERT INTO share_jobs(kind,status) VALUES(?,'working')", ("autoreel" if reel else "auto",)).lastrowid
+                db().commit()
+                p, msgs = run_auto_post(t, reel=reel)
+                good = [m for m in msgs if m.startswith("✅")]
+                bad = [m for m in msgs if m.startswith("❌")] or ([] if good else ["x"])
+                db().execute("UPDATE share_jobs SET product_id=?, status=?, result=?, finished_at=CURRENT_TIMESTAMP WHERE id=?",
+                             (p["id"] if p else "", "done" if good and not bad else ("partial" if good else "failed"), json.dumps(msgs), jid))
+                db().commit()
                 ran.append((t, p["id"] if p else "none"))
             return ran
         except Exception:
@@ -3466,8 +3485,13 @@ def start_autopost(flask_app):
         pass
 
     def loop():
+        try:
+            with flask_app.app_context():
+                purge_reels(older_minutes=0)          # nothing from before a restart is kept
+        except Exception:
+            pass
         while True:
-            time.sleep(60)
+            time.sleep(15)
             auto_tick(flask_app)
     threading.Thread(target=loop, daemon=True, name="autopost").start()
 
@@ -3524,10 +3548,11 @@ def admin_share():
 {% if rdy.fb %}<span class="tag g">Facebook · {{ fb_name }}</span>{% endif %} {% if rdy.ig %}<span class="tag g">Instagram · @{{ ig_name }}</span>{% endif %}
 · <a href="{{ url_for('web.admin_share', refresh=1) }}">↻ Refresh names</a> · <a href="{{ url_for('web.admin_share_connect') }}">Reconnect</a></p>{% endif %}
 {% if jobs %}<div class="card" style="padding:12px;margin-bottom:12px" id="jobs"><b>📤 Sending</b>
-{% for j in jobs %}<div class="small" style="margin-top:6px"><b>{{ j['name'] }}</b>{% if j['kind']=='reel' %} 🎬{% endif %} · {{ j['at'] }}
+{% for j in jobs %}<div class="small" style="margin-top:6px"><b>{{ j['name'] }}</b>{% if j['kind'] in ('reel','autoreel') %} 🎬{% endif %}{% if j['kind'] in ('auto','autoreel') %} 🤖{% endif %} · {{ j['at'] }}
 {% if j['status'] in ('queued','working') %}<span style="color:#b26a00">⏳ sending…</span>{% elif j['status']=='done' %}<span style="color:#2a8a4a">✅ sent</span>{% elif j['status']=='partial' %}<span style="color:#b26a00">⚠️ partly sent</span>{% else %}<span style="color:#c0392b">❌ not sent</span>{% endif %}
 {% for m in j['msgs'] %}<div class="mut">{{ m }}</div>{% endfor %}</div>{% endfor %}</div>
 {% if busy %}<script>setTimeout(function(){location.reload()},4000);</script>{% endif %}{% endif %}
+<script>(function(){var s0="{{ sig }}";setInterval(function(){fetch("{{ url_for('web.admin_share_pulse') }}",{credentials:"same-origin"}).then(function(r){return r.json()}).then(function(d){if(d.sig!==s0)location.reload()}).catch(function(){})},10000)})();</script>
 {% if rdy.fb or rdy.ig %}<form method="post" action="{{ url_for('web.admin_share_auto') }}" class="card" style="padding:14px;margin-bottom:12px"><input type="hidden" name="csrf" value="{{ csrf }}">
 <div class="row between"><b>🤖 Auto-post</b><label class="small"><input type="checkbox" name="auto_on" value="1" {{ 'checked' if auto_on else '' }}> {{ 'ON' if auto_on else 'OFF' }}</label></div>
 <p class="mut small" style="margin:6px 0">At each time below, if you have not posted yourself, the app posts the product that has waited longest. Nigeria time.</p>
@@ -3548,7 +3573,7 @@ def admin_share():
                       rdy=rdy, prods=prods, recent=recent, fb_name=setting("meta_page_name"), ig_name=setting("meta_ig_name"),
                       auto_on=setting("auto_on", "0") == "1", af=setting("auto_fb", "1") == "1", ai=setting("auto_ig", "1") == "1",
                       times=(auto_times() + ["", "", ""])[:3], ar=setting("auto_reel", "0") == "1", nxt=pick_auto_product(),
-                      jobs=_jobs, busy=any(j["status"] in ("queued", "working") for j in _jobs))
+                      jobs=_jobs, busy=any(j["status"] in ("queued", "working") for j in _jobs), sig=_job_sig())
 
 
 @bp.route("/admin/share/<pid>", methods=["GET", "POST"])
@@ -3777,6 +3802,7 @@ def register(flask_app, cfg):
 # music written in code (so there are no copyright problems). Posted to Instagram Reels and the Facebook Page.
 REEL_W, REEL_H, REEL_FPS = 1080, 1920, 30
 REEL_GOLD, REEL_INK = (212, 169, 74), (13, 13, 13)
+REEL_MAX_BYTES = 9_500_000
 MUSIC_SR = 44100
 
 
@@ -4130,42 +4156,92 @@ def make_reel(p, take=0):
             f = os.path.join(work, f"s{i}.png")
             im.save(f)
             files.append(f)
-        T, durs = 0.4, [d for _i, d in scenes]
+        durs = [d for _i, d in scenes]
         total = sum(durs)
         seed = int(hashlib.sha256(f"{p['id']}-{take}-{time.strftime('%Y%m%d')}".encode()).hexdigest()[:8], 16)
         wav = os.path.join(work, "music.wav")
         make_music(_music_style(tone), total, seed, wav)
-        cmd, filt = [ff, "-y", "-loglevel", "error"], []
-        for f in files:
-            cmd += ["-i", f]
-        cmd += ["-i", wav]
-        for i, d in enumerate(durs):
-            frames = int(round((d + (T if i < len(durs) - 1 else 0)) * REEL_FPS))
-            z = ("min(zoom+0.0007,1.12)" if i % 2 == 0 else "if(eq(on,0),1.12,max(zoom-0.0007,1.0))")
-            filt.append(f"[{i}:v]scale=2160:3840:flags=bilinear,zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
-                        f":d={frames}:s={REEL_W}x{REEL_H}:fps={REEL_FPS},setsar=1,format=yuv420p[v{i}]")
-        last, acc = "v0", 0.0
-        for i in range(1, len(durs)):
-            acc += durs[i - 1]
-            filt.append(f"[{last}][v{i}]xfade=transition=fade:duration={T}:offset={acc:.2f}[x{i}]")
-            last = f"x{i}"
-        cmd += ["-filter_complex", ";".join(filt), "-map", f"[{last}]", "-map", f"{len(files)}:a",
-                "-t", f"{total:.2f}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-profile:v", "high",
-                "-pix_fmt", "yuv420p", "-r", str(REEL_FPS), "-g", "60", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
-                "-movflags", "+faststart", out]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if r.returncode != 0 or not os.path.exists(out):
-            raise ReelError("Video maker error: " + (r.stderr or "unknown")[-300:])
+
+        def run(cmd):
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            if r.returncode != 0:
+                why = (r.stderr or "").strip()[-250:]
+                if r.returncode < 0 or not why:
+                    why = f"the video tool was stopped (code {r.returncode}), most likely the server ran out of memory. " + why
+                raise ReelError("Video maker error: " + why)
+
+        def render(w, h, rate="2500k"):
+            """One small clip per picture (one ffmpeg at a time keeps memory low), joined without re-encoding."""
+            clips = []
+            for i, f in enumerate(files):
+                d = durs[i]
+                frames = int(round(d * REEL_FPS))
+                z = ("min(zoom+0.0006,1.10)" if i % 2 == 0 else "if(eq(on,0),1.10,max(zoom-0.0006,1.0))")
+                vf = (f"scale={int(w * 1.1)}:{int(h * 1.1)},zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+                      f":d={frames}:s={w}x{h}:fps={REEL_FPS},fade=t=in:st=0:d=0.25,fade=t=out:st={d - 0.25:.2f}:d=0.25,format=yuv420p")
+                clip = os.path.join(work, f"c{i}.mp4")
+                run([ff, "-y", "-loglevel", "error", "-i", f, "-vf", vf, "-frames:v", str(frames), "-an",
+                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-maxrate", rate, "-bufsize", "2M",
+                     "-profile:v", "high", "-pix_fmt", "yuv420p",
+                     "-r", str(REEL_FPS), "-g", "60", "-threads", "1", "-filter_threads", "1",
+                     "-x264-params", "rc-lookahead=8:sync-lookahead=0:ref=1:bframes=1", clip])
+                clips.append(clip)
+            lst = os.path.join(work, "list.txt")
+            with open(lst, "w") as fh:
+                fh.write("".join(f"file '{c}'\n" for c in clips))
+            run([ff, "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", lst, "-i", wav,
+                 "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+                 "-t", f"{total:.2f}", "-movflags", "+faststart", out])
+
+        try:
+            render(REEL_W, REEL_H)
+            if os.path.getsize(out) > REEL_MAX_BYTES:           # keep every video under 10 MB
+                os.remove(out)
+                render(720, 1280, "1200k")
+        except ReelError as e:
+            if "stopped" not in str(e):
+                raise
+            for f in os.listdir(work):                    # the server is small: try again at 720x1280 (still fine for Reels)
+                if f.startswith("c") and f.endswith(".mp4"):
+                    os.remove(os.path.join(work, f))
+            render(720, 1280)
+        if not os.path.exists(out) or os.path.getsize(out) < 10000:
+            raise ReelError("Video maker error: the video file was not created.")
     finally:
         import shutil
         shutil.rmtree(work, ignore_errors=True)
-    for old in sorted((os.path.join(_reel_dir(), x) for x in os.listdir(_reel_dir()) if x.endswith(".mp4")),
-                      key=os.path.getmtime)[:-12]:
+    purge_reels(keep=out)
+    return out
+
+
+def purge_reels(older_minutes=60, keep=None):
+    """Videos are only kept while needed (preview or sending). Anything older than an hour is deleted."""
+    d, cutoff = _reel_dir(), time.time() - older_minutes * 60
+    for x in os.listdir(d):
+        pth = os.path.join(d, x)
         try:
-            os.remove(old)
+            if pth != keep and ((x.endswith(".mp4") and os.path.getmtime(pth) < cutoff) or x.startswith("tmp_")):
+                if os.path.isdir(pth):
+                    import shutil
+                    shutil.rmtree(pth, ignore_errors=True)
+                else:
+                    os.remove(pth)
         except OSError:
             pass
-    return out
+
+
+def _discard_video(path, delay=0):
+    def rm():
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    if delay:
+        t = threading.Timer(delay, rm)
+        t.daemon = True
+        t.start()
+    else:
+        rm()
 
 
 def _vid_sig(name):
@@ -4208,7 +4284,7 @@ def post_instagram_reel(video_url, caption):
     return _graph("POST", f"/{ig}/media_publish", {"creation_id": cid, "access_token": tok}, base=base).get("id", "")
 
 
-def post_facebook_reel(video_url, caption):
+def post_facebook_reel(video_url, caption, info=None):
     page, tok = setting("meta_fb_page_id"), setting("meta_page_token")
     try:
         s = _graph("POST", f"/{page}/video_reels", {"upload_phase": "start", "access_token": tok})
@@ -4219,13 +4295,22 @@ def post_facebook_reel(video_url, caption):
                                                  "video_state": "PUBLISHED", "description": caption, "access_token": tok})
         return s["video_id"]
     except Exception:
-        # Fall back to an ordinary Facebook video if the Reel route is refused.
+        # Fall back to an ordinary Facebook video if the Reel route is refused (Facebook then fetches the file later).
+        if info is not None:
+            info["late_fetch"] = True
         return _graph("POST", f"/{page}/videos", {"file_url": video_url, "description": caption, "access_token": tok}).get("id", "")
 
 
 def do_reel(p, path, want, caps=None, auto=0):
-    rdy, caps, out, pid = social_ready(), caps or {}, [], p["id"]
+    rdy, caps, out, pid, info = social_ready(), caps or {}, [], p["id"], {}
     url = pub_vid_url(path)
+    try:
+        return _do_reel(p, url, want, rdy, caps, out, pid, info, auto)
+    finally:                                      # the video is not kept on the server once it has been sent
+        _discard_video(path, delay=900 if info.get("late_fetch") else 0)
+
+
+def _do_reel(p, url, want, rdy, caps, out, pid, info, auto=0):
     for plat, fn in (("fb", post_facebook_reel), ("ig", post_instagram_reel)):
         if plat not in want or not rdy[plat]:
             continue
@@ -4234,7 +4319,7 @@ def do_reel(p, path, want, caps=None, auto=0):
         if not caption or _norm(caption) in used_captions(pid, label):
             caption = fresh_caption(p, plat)
         try:
-            rid = fn(url, caption[:2100])
+            rid = fn(url, caption[:2100], info) if plat == "fb" else fn(url, caption[:2100])
             db().execute("INSERT INTO social_posts(product_id,platform,status,remote_id,caption,auto) VALUES(?,?,?,?,?,?)",
                          (pid, label, "ok", str(rid), caption[:2100], auto))
             out.append(f"✅ Posted Reel to {label}")
