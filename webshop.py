@@ -3198,7 +3198,9 @@ def _build(p, platform, shuffle=0):
         lines.append(rnd.choice(_ORDER_IG) + (f" or WhatsApp {wa}" if wa else ""))
         lines.append("📍 Bauchi, Nigeria · Delivery nationwide")
         tag = re.sub(r"[^A-Za-z0-9]", "", p["name"])
-        lines.append(rnd.choice(tags) + (f" #{tag}" if tag else ""))
+        rest = [w for w in rnd.choice(tags).split() if w != "#ADFashion"]
+        picked = ["#ADFashion"] + rnd.sample(rest, min(3, len(rest))) + ([f"#{tag}"] if tag else [])
+        lines.append(" ".join(picked[:5]))                 # Instagram now allows at most 5 hashtags per post
     else:
         lines.append(rnd.choice(_ORDER_FB).format(site=site))
         if wa:
@@ -3209,6 +3211,63 @@ def _build(p, platform, shuffle=0):
 
 def make_caption(p, platform, shuffle=0):
     return _build(p, platform, shuffle)[0]
+
+
+# ---- Reel captions: very short, plus a few reachable hashtags (Instagram allows 5 at most)
+_REEL_SHORT = {
+    "modest": ["Pure elegance ✨", "Modesty looks good 🤍", "New drop 🧕🏽", "Queen vibes 👑", "Obsessed 😍", "Soft and stylish 🌸",
+               "Grace in every layer 🤍", "{name} ✨", "Meet the {name} 💫", "Your next favourite 💖", "Wrapped in class 🧕🏽", "Simply beautiful 🌷"],
+    "fabric": ["Fresh fabric 🧵", "Tailors, look! ✂️", "Quality you can feel 🧵", "New roll in 🛍️", "Sew your dream 💎", "{name} 🧵",
+               "Owambe ready? 🎉", "Pick your yards 📏", "Rich texture 😍", "Meet the {name} ✨", "Fabric goals 🔥", "Made for your tailor 🪡"],
+    "watch": ["Time to shine ⌚", "Wrist goals 🔥", "Class on the wrist 🕰️", "{name} ⌚", "Be on time, in style ✨", "Clean and sharp 😎",
+              "Gift idea 🎁", "Meet the {name} ⌚", "Upgrade your wrist 💎", "Looks like money 💰", "Details that stand out ✨", "Wear confidence 👑"],
+    "shoes": ["Step up 👞", "Fresh pair 🔥", "Walk in style 👠", "{name} 👟", "Comfort and class ✨", "New pair alert 🛍️",
+              "Meet the {name} 👞", "Clean look 😎", "Own the room 👑", "Your next pair 💫", "Made to walk 💖", "Style from the ground up ✨"],
+    "caps": ["Cap on 🧢", "Cap game strong 🔥", "Fresh cap 😎", "{name} 🧢", "Simple and cool ✨", "New in 🛍️",
+             "Meet the {name} 🧢", "Top it off 👑", "Sun out, cap on ☀️", "Easy to style 😉", "Your next cap 💫", "Keep it clean ✨"],
+    "eyewear": ["Cool shades 🕶️", "See and be seen 😎", "Frame your style ✨", "{name} 🕶️", "Sun ready ☀️", "New shades 🔥",
+                "Meet the {name} 🕶️", "Small piece, big style 💎", "Bring the confidence 👑", "Your new pair 💫", "Swag added 😎", "Look sharp ✨"],
+    "accessory": ["Finishing touch ✨", "Small detail, big style 💎", "New in 🛍️", "{name} ✨", "Complete the look 🌟", "Treat yourself 🎁",
+                  "Meet the {name} 💫", "Little extra 👑", "You will want this 😍", "Style it your way 💖", "Just landed 🔥", "New arrival 🌷"],
+    "default": ["New in ✨", "Just landed 🔥", "Meet the {name} 💫", "{name} ✨", "Treat yourself 💖", "Style that speaks 👑",
+                "Fresh arrival 🌷", "Quality you can feel 🤍", "Look what is new 🛍️", "Something new 🎉", "Customer favourite 😍", "Don't miss this 💎"],
+}
+_REEL_NICHE = {
+    "modest": ["#hijabfashion", "#modestfashion", "#hijabstyle", "#jilbab", "#hijabi", "#modestwear"],
+    "fabric": ["#fabric", "#nigerianfabrics", "#asoebi", "#tailor", "#fabricstore", "#textiles"],
+    "watch": ["#watches", "#watchesofinstagram", "#mensfashion", "#wristwatch", "#watchlover"],
+    "shoes": ["#shoes", "#footwear", "#shoelover", "#shoesoftheday", "#fashionshoes"],
+    "caps": ["#caps", "#capstyle", "#streetwear", "#hats", "#menswear"],
+    "eyewear": ["#sunglasses", "#shades", "#eyewear", "#sunglassesstyle", "#fashionglasses"],
+    "accessory": ["#accessories", "#fashionaccessories", "#fashionfinds", "#styleinspo", "#outfitdetails"],
+    "default": ["#fashion", "#style", "#newarrival", "#shopsmall", "#fashionstyle"],
+}
+_REEL_PLACE = ["#nigeriafashion", "#naijafashion", "#arewa", "#northernnigeria", "#bauchi"]
+_REEL_REACH = ["#reels", "#explore", "#fyp", "#trending", "#viral", "#reelsinstagram"]
+
+
+def _reel_caption(p, n=0):
+    import random
+    rnd = random.Random(f"reel-{p['id']}-{n}")
+    tone = tone_of(p)
+    phrase = rnd.choice(_REEL_SHORT.get(tone, _REEL_SHORT["default"])).replace("{name}", p["name"])
+    tags = ["#ADFashion"] + rnd.sample(_REEL_NICHE.get(tone, _REEL_NICHE["default"]), 2) + [rnd.choice(_REEL_PLACE), rnd.choice(_REEL_REACH)]
+    return phrase + "\n\n" + " ".join(tags)
+
+
+def fresh_reel_caption(p, plat, start=0):
+    """Short Reel caption never used before for this product, and not starting like the last few posts of other products."""
+    label = "Facebook" if plat == "fb" else "Instagram"
+    used = used_captions(p["id"], label)
+    recent = {r[0].split("\n")[0] for r in db().execute(
+        "SELECT caption FROM social_posts WHERE status='ok' AND caption!='' ORDER BY id DESC LIMIT 6").fetchall()}
+    n, cap = start, ""
+    for k in range(300):
+        cap = _reel_caption(p, n)
+        if _norm(cap) not in used and (cap.split("\n")[0] not in recent or k >= 120):
+            return cap
+        n += 1
+    return cap + " " + time.strftime("%d%b")
 
 
 def post_facebook(img_urls, caption):
@@ -3949,8 +4008,14 @@ def make_music(style, seconds, seed, path):
                 put(melodic, tone(m, bar, "pad"), t0, 0.07)
     # a little room reverb on the melodic part
     ir = rng.standard_normal(int(sr * 0.8)) * np.exp(-np.arange(int(sr * 0.8)) / (sr * 0.2))
-    size = 1 << (n + len(ir)).bit_length()
-    wet = np.fft.irfft(np.fft.rfft(melodic, size) * np.fft.rfft(ir, size), size)[:n]
+    blk = 65536
+    size = 1 << (blk + len(ir) - 1).bit_length()
+    irf = np.fft.rfft(ir, size)
+    wet = np.zeros(n + size)
+    for s0 in range(0, n, blk):                       # overlap-add: small memory instead of one huge FFT
+        seg = np.fft.irfft(np.fft.rfft(melodic[s0:s0 + blk], size) * irf, size)
+        wet[s0:s0 + size] += seg
+    wet = wet[:n]
     wet *= (np.abs(melodic).max() / (np.abs(wet).max() or 1)) * 0.5
     mix = melodic + wet + drums
     mix = np.tanh(mix * 1.1)
@@ -4147,16 +4212,19 @@ def make_reel(p, take=0):
     work = os.path.join(_reel_dir(), "tmp_" + key)
     os.makedirs(work, exist_ok=True)
     try:
-        scenes = [(_scene_intro(), 1.6)]
-        for pth in paths:
-            scenes.append((_scene_photo(pth, name, price), 3.0 if len(paths) > 1 else 5.0))
-        scenes.append((_scene_outro(paths[0], name, price, site_base(), wa), 2.8))
-        files = []
-        for i, (im, _d) in enumerate(scenes):
+        import gc
+        plan = [("intro", None, 1.6)] + [("photo", pth, 3.0 if len(paths) > 1 else 5.0) for pth in paths] + [("outro", paths[0], 2.8)]
+        files, durs = [], []
+        for i, (kind, pth, d) in enumerate(plan):          # one picture in memory at a time
+            im = (_scene_intro() if kind == "intro" else _scene_photo(pth, name, price) if kind == "photo"
+                  else _scene_outro(pth, name, price, site_base(), wa))
             f = os.path.join(work, f"s{i}.png")
             im.save(f)
+            im.close()
+            del im
             files.append(f)
-        durs = [d for _i, d in scenes]
+            durs.append(d)
+        gc.collect()
         total = sum(durs)
         seed = int(hashlib.sha256(f"{p['id']}-{take}-{time.strftime('%Y%m%d')}".encode()).hexdigest()[:8], 16)
         wav = os.path.join(work, "music.wav")
@@ -4170,7 +4238,7 @@ def make_reel(p, take=0):
                     why = f"the video tool was stopped (code {r.returncode}), most likely the server ran out of memory. " + why
                 raise ReelError("Video maker error: " + why)
 
-        def render(w, h, rate="2500k"):
+        def render(w, h, rate="2000k"):
             """One small clip per picture (one ffmpeg at a time keeps memory low), joined without re-encoding."""
             clips = []
             for i, f in enumerate(files):
@@ -4181,10 +4249,9 @@ def make_reel(p, take=0):
                       f":d={frames}:s={w}x{h}:fps={REEL_FPS},fade=t=in:st=0:d=0.25,fade=t=out:st={d - 0.25:.2f}:d=0.25,format=yuv420p")
                 clip = os.path.join(work, f"c{i}.mp4")
                 run([ff, "-y", "-loglevel", "error", "-i", f, "-vf", vf, "-frames:v", str(frames), "-an",
-                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-maxrate", rate, "-bufsize", "2M",
+                     "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26", "-maxrate", rate, "-bufsize", "2M",
                      "-profile:v", "high", "-pix_fmt", "yuv420p",
-                     "-r", str(REEL_FPS), "-g", "60", "-threads", "1", "-filter_threads", "1",
-                     "-x264-params", "rc-lookahead=8:sync-lookahead=0:ref=1:bframes=1", clip])
+                     "-r", str(REEL_FPS), "-g", "60", "-threads", "1", "-filter_threads", "1", clip])
                 clips.append(clip)
             lst = os.path.join(work, "list.txt")
             with open(lst, "w") as fh:
@@ -4317,7 +4384,7 @@ def _do_reel(p, url, want, rdy, caps, out, pid, info, auto=0):
         label = "Facebook" if plat == "fb" else "Instagram"
         caption = (caps.get(plat) or "").strip()
         if not caption or _norm(caption) in used_captions(pid, label):
-            caption = fresh_caption(p, plat)
+            caption = fresh_reel_caption(p, plat)
         try:
             rid = fn(url, caption[:2100], info) if plat == "fb" else fn(url, caption[:2100])
             db().execute("INSERT INTO social_posts(product_id,platform,status,remote_id,caption,auto) VALUES(?,?,?,?,?,?)",
