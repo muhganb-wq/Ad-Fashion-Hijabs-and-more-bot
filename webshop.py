@@ -3514,14 +3514,33 @@ def post_facebook(img_urls, caption):
     return r.get("id", "")
 
 
-def _ig_wait(cid, tok, base, tries=15, pause=2):
-    for _ in range(tries):                       # wait until Instagram has fetched the picture or video
+def _ig_wait(cid, tok, base, tries=45, pause=2):
+    """Wait until Instagram has fetched and processed the picture or video. Never goes on while it is still working."""
+    for _ in range(tries):
         st = _graph("GET", f"/{cid}", {"fields": "status_code", "access_token": tok}, base=base).get("status_code", "FINISHED")
         if st == "FINISHED":
             return
         if st in ("ERROR", "EXPIRED"):
             raise RuntimeError("Instagram could not use this picture or video.")
         time.sleep(pause)
+    raise RuntimeError("Instagram is still processing the post. It will be tried again.")
+
+
+def _ig_publish(ig, cid, tok, base):
+    """Publish a finished container. Instagram sometimes says 'Media ID is not available' for a few seconds after a
+    container is ready: wait and try again instead of failing."""
+    last = None
+    for n in range(5):
+        try:
+            return _graph("POST", f"/{ig}/media_publish", {"creation_id": cid, "access_token": tok}, base=base).get("id", "")
+        except RuntimeError as e:
+            last = e
+            m = str(e).lower()
+            if "not available" in m or "not ready" in m or "try again" in m or "2207027" in m:
+                time.sleep(8)
+                continue
+            raise
+    raise last
 
 
 def post_instagram(img_urls, caption):
@@ -3540,7 +3559,7 @@ def post_instagram(img_urls, caption):
         cid = _graph("POST", f"/{ig}/media", {"media_type": "CAROUSEL", "children": ",".join(kids),
                                               "caption": caption, "access_token": tok}, base=base)["id"]
     _ig_wait(cid, tok, base)
-    return _graph("POST", f"/{ig}/media_publish", {"creation_id": cid, "access_token": tok}, base=base).get("id", "")
+    return _ig_publish(ig, cid, tok, base)
 
 
 def share_photos(pid):
@@ -3563,6 +3582,9 @@ def do_share(p, picked, want, caps=None, auto=0):
         caption = caption[:2100]
         urls = [pub_img_url(f, fit=(plat == "ig" and len(picked) > 1)) for f in picked]
         try:
+            with _share_tmp():                        # have every picture ready first, so Instagram's download is quick
+                for f in picked:
+                    fetch_file(f)
             rid = fn(urls, caption)
             db().execute("INSERT INTO social_posts(product_id,platform,status,remote_id,caption,auto) VALUES(?,?,?,?,?,?)",
                          (pid, label, "ok", str(rid), caption, auto))
@@ -3733,16 +3755,17 @@ def pick_auto_product(kind="photo", pop=False):
     return elig[pid]
 
 
-def run_auto_post(slot_label="", force=False, reel=False):
-    """Post one random product now (as a Reel when asked). Returns (product or None, messages)."""
+def run_auto_post(slot_label="", force=False, reel=False, only=None, pid=None):
+    """Post one random product now (as a Reel when asked). Returns (product or None, messages).
+    only/pid = a retry: the same product again, on just the platforms that failed the first time."""
     rdy = social_ready()
-    want = [pl for pl in ("fb", "ig") if setting("auto_" + pl, "1") == "1" and rdy[pl]]
+    want = [pl for pl in ("fb", "ig") if setting("auto_" + pl, "1") == "1" and rdy[pl] and (only is None or pl in only)]
     if not want:
         return None, ["❌ Auto-post: connect Facebook or Instagram first."]
     if not site_base():
         return None, ["❌ Auto-post: the app address is unknown. Set SITE_URL in Railway or open the Share page once."]
     kind = "reel" if reel else "photo"
-    p = pick_auto_product(kind, pop=True)
+    p = db().execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone() if pid else pick_auto_product(kind, pop=True)
     if not p:
         return None, ["❌ Auto-post: no product in stock with a photo."]
     try:
@@ -3794,13 +3817,21 @@ def _run_slot(flask_app, kind, skey):
         try:
             jid = db().execute("INSERT INTO share_jobs(kind,status) VALUES(?,'working')", ("autoreel" if kind == "reel" else "auto",)).lastrowid
             db().commit()
-            p, msgs = run_auto_post(skey, reel=(kind == "reel"))
+            part = {}
+            try:
+                part = json.loads(setting("auto_part_" + skey, "{}") or "{}")
+            except ValueError:
+                part = {}
+            p, msgs = run_auto_post(skey, reel=(kind == "reel"), only=part.get("only"), pid=part.get("pid"))
             good = [m for m in msgs if m.startswith("✅")]
             bad = [m for m in msgs if m.startswith("❌")]
             status = "done" if good and not bad else ("partial" if good else "failed")
+            failed = [pl for pl, w in (("fb", "Facebook"), ("ig", "Instagram")) if any(w in m for m in bad)]
+            if p and good and failed:                      # one platform worked, the other did not: the retry covers only the failed one
+                set_setting("auto_part_" + skey, json.dumps({"pid": p["id"], "only": failed}))
             db().execute("UPDATE share_jobs SET product_id=?, status=?, result=?, finished_at=CURRENT_TIMESTAMP WHERE id=?",
                          (p["id"] if p else "", status, json.dumps(msgs), jid))
-            if good:
+            if good and not bad:                           # finished only when every wanted platform has it
                 set_setting("auto_done_" + skey, "1")
             set_setting("auto_last", f"{datetime.now(LAGOS):%d %b %H:%M} · {'Reel' if kind == 'reel' else 'Photo'} · "
                                      f"{p['name'] if p else '-'} · {status}")
@@ -5065,7 +5096,7 @@ def post_instagram_reel(video_url, caption):
     cid = _graph("POST", f"/{ig}/media", {"media_type": "REELS", "video_url": video_url, "caption": caption,
                                            "share_to_feed": "true", "access_token": tok}, base=base)["id"]
     _ig_wait(cid, tok, base, tries=70, pause=3)                 # Instagram needs a little while to process a video
-    return _graph("POST", f"/{ig}/media_publish", {"creation_id": cid, "access_token": tok}, base=base).get("id", "")
+    return _ig_publish(ig, cid, tok, base)
 
 
 def post_facebook_reel(video_url, caption, info=None):
