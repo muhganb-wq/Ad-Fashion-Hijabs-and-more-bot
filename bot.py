@@ -382,6 +382,12 @@ def init_db():
         )
     """)
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS custom_fabrics(
+            key TEXT PRIMARY KEY, name TEXT NOT NULL, active INTEGER DEFAULT 1, position INTEGER DEFAULT 0
+        )
+    """)
+
     # Product gallery: many photos per product; optional label (e.g. a colour name).
     c.execute("""
         CREATE TABLE IF NOT EXISTS product_photos(
@@ -395,6 +401,8 @@ def init_db():
     """)
 
     # Color/fabric selection fields for order items. Safe for existing databases.
+    if "sold_out" not in {row[1] for row in c.execute("PRAGMA table_info(product_photos)").fetchall()}:
+        c.execute("ALTER TABLE product_photos ADD COLUMN sold_out INTEGER DEFAULT 0")
     order_item_cols = {row[1] for row in c.execute("PRAGMA table_info(order_items)").fetchall()}
     if "color_id" not in order_item_cols:
         c.execute("ALTER TABLE order_items ADD COLUMN color_id INTEGER")
@@ -514,9 +522,9 @@ def get_product_photos(product_id):
     ).fetchall()
     legacy = c.execute("SELECT photo_file_id FROM products WHERE id=?", (product_id,)).fetchone()
     c.close()
-    photos = [{"id": r["id"], "file_id": r["file_id"], "label": r["label"] or ""} for r in rows]
+    photos = [{"id": r["id"], "file_id": r["file_id"], "label": r["label"] or "", "sold_out": r["sold_out"] or 0} for r in rows]
     if not photos and legacy and legacy["photo_file_id"]:
-        photos = [{"id": 0, "file_id": legacy["photo_file_id"], "label": ""}]
+        photos = [{"id": 0, "file_id": legacy["photo_file_id"], "label": "", "sold_out": 0}]
     return photos
 
 
@@ -568,9 +576,10 @@ def gallery_admin_view(product_id):
     rows = []
     for i, p in enumerate(photos, 1):
         label = md_escape(p["label"]) if p["label"] else "no label"
-        lines.append(f"{i}. {label}")
+        lines.append(f"{i}. {label}" + ("  🚫 SOLD OUT" if p["sold_out"] else ""))
         if p["id"]:
-            rows.append([InlineKeyboardButton(f"🗑️ Delete #{i}", callback_data=f"adm:galdel:{p['id']}:{product_id}")])
+            rows.append([InlineKeyboardButton(f"🗑️ Delete #{i}", callback_data=f"adm:galdel:{p['id']}:{product_id}"),
+                         InlineKeyboardButton(f"✅ Restock #{i}" if p["sold_out"] else f"🚫 Sold out #{i}", callback_data=f"adm:galsold:{p['id']}:{product_id}")])
     rows.insert(0, [InlineKeyboardButton("➕ Add Photos / Colors", callback_data=f"adm:galadd:{product_id}")])
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data=f"adm:editp:{product_id}")])
     return "\n".join(lines), InlineKeyboardMarkup(rows)
@@ -694,15 +703,66 @@ def get_color_option(color_id):
     return row
 
 
-FABRICS = [("dk", "Dan Kaduna Fabric"), ("zm", "Zoom Fabric"), ("eg", "Egyptian Fabric")]
+_BASE_FABRICS = [("dk", "Dan Kaduna Fabric"), ("zm", "Zoom Fabric"), ("eg", "Egyptian Fabric")]
+FABRICS = list(_BASE_FABRICS)          # the three built-in fabrics + any fabric you add yourself (see custom_fabrics)
 # Textiles are sold by length or by piece: "per yard" or "per trouser", each with its own price.
 UNITS = [("yd", "Per yard"), ("tr", "Per trouser")]
 UNIT_WORD = {"yd": "yard", "tr": "trouser"}
 ALL_PRICE_KEYS = FABRICS + UNITS
+FABRIC_NAME = dict(ALL_PRICE_KEYS)
+_FAB_STAMP = [0.0]
+
+
+def refresh_fabrics(force=False):
+    """Load the fabrics you added yourself. Lists are changed in place so every part of the app sees them."""
+    import time as _t
+    if not force and _t.time() - _FAB_STAMP[0] < 3:
+        return
+    _FAB_STAMP[0] = _t.time()
+    try:
+        c = conn()
+        rows = c.execute("SELECT key,name,active FROM custom_fabrics ORDER BY position,rowid").fetchall()
+        c.close()
+    except Exception:
+        return
+    FABRICS[:] = list(_BASE_FABRICS) + [(r["key"], r["name"]) for r in rows if r["active"]]
+    ALL_PRICE_KEYS[:] = FABRICS + UNITS
+    FABRIC_NAME.clear()
+    FABRIC_NAME.update(dict(_BASE_FABRICS + UNITS))
+    FABRIC_NAME.update({r["key"]: r["name"] for r in rows})      # hidden ones keep their name for old orders
+
+
+def add_custom_fabric(name):
+    """Add a new fabric (e.g. Crepe) without touching the existing ones. Returns (key, label) or None."""
+    name = re.sub(r"\s+", " ", (name or "").strip())[:30]
+    if len(name) < 2:
+        return None
+    label = name if name.lower().endswith("fabric") else name + " Fabric"
+    refresh_fabrics(True)
+    for k, n in FABRIC_NAME.items():                  # same name again: bring it back instead of duplicating
+        if n.lower() == label.lower():
+            c = conn(); c.execute("UPDATE custom_fabrics SET active=1 WHERE key=?", (k,)); c.commit(); c.close()
+            refresh_fabrics(True)
+            return k, n
+    base = "x" + (re.sub(r"[^a-z0-9]", "", name.lower())[:8] or "f")
+    key, i = base, 1
+    while key in FABRIC_NAME:
+        i += 1; key = f"{base}{i}"
+    c = conn()
+    c.execute("INSERT INTO custom_fabrics(key,name,active,position) VALUES(?,?,1,(SELECT COALESCE(MAX(position),0)+1 FROM custom_fabrics))", (key, label))
+    c.commit(); c.close()
+    refresh_fabrics(True)
+    return key, label
+
+
+def hide_custom_fabric(key):
+    c = conn(); c.execute("UPDATE custom_fabrics SET active=0 WHERE key=?", (key,)); c.commit(); c.close()
+    refresh_fabrics(True)
 
 
 def fabric_label(key):
-    return dict(ALL_PRICE_KEYS).get(key, key or "")
+    refresh_fabrics()
+    return FABRIC_NAME.get(key, key or "")
 
 
 def is_unit_key(key):
@@ -741,6 +801,7 @@ def parse_qty(text, decimal=False, lo=1, hi=500):
 
 def get_fabric_prices(product_id):
     """{'dk': 5000, ...} for fabrics that have a price set on this product."""
+    refresh_fabrics()
     c = conn()
     rows = c.execute("SELECT fabric, price FROM product_fabric_prices WHERE product_id=? AND price>0", (product_id,)).fetchall()
     c.close()
@@ -1983,6 +2044,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop("admin_setting", None)
             await message.reply_text("✅ Saved. Customers see it immediately.",
                                      reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Continue", callback_data=back)]]))
+        elif key == "newfabric":
+            res = add_custom_fabric(text)
+            if res:
+                context.user_data.pop("admin_setting", None)
+                await message.reply_text(f"✅ {res[1]} added. Now set its price on each product.",
+                                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧵 Fabric Prices", callback_data=f"adm:fabp:{adm_set['pid']}")]]))
+            else:
+                await message.reply_text("Please send a name with at least 2 letters, e.g. Crepe.")
         elif key == "fabprice":
             digits = text.replace(",", "").replace("₦", "").strip()
             if digits.isdigit():
@@ -2321,8 +2390,8 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             media = []
             for i, p in enumerate(photos):
                 cap = text if i == 0 else ""
-                if p["label"]:
-                    cap = (cap + "\n\n" if cap else "") + f"🎨 {md_escape(p['label'])}"
+                if p["label"] or p["sold_out"]:
+                    cap = (cap + "\n\n" if cap else "") + (f"🎨 {md_escape(p['label'])}" if p["label"] else "") + (("  " if p["label"] else "") + "🚫 *SOLD OUT*" if p["sold_out"] else "")
                 if i == 0 and len(photos) > 1:
                     cap = (cap + "\n\n" if cap else "") + f"👉 Swipe to see all {len(photos)} photos"
                 media.append(InputMediaPhoto(media=p["file_id"], caption=cap[:1024] or None, parse_mode=ParseMode.MARKDOWN))
@@ -3777,6 +3846,15 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await safe_edit_query(query, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
         return
 
+    if data.startswith("adm:galsold:"):
+        _, _, photo_id, product_id = data.split(":", 3)
+        c = conn()
+        c.execute("UPDATE product_photos SET sold_out=1-COALESCE(sold_out,0) WHERE id=?", (int(photo_id),))
+        c.commit(); c.close()
+        text, kb = gallery_admin_view(product_id)
+        await safe_edit_query(query, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+        return
+
     if data.startswith("adm:galdel:"):
         _, _, photo_id, product_id = data.split(":", 3)
         delete_product_photo(int(photo_id))
@@ -4364,7 +4442,31 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 "\nIf no price is set here, the normal price is used.")
         await safe_edit_query(query, text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton(f"✏️ {lab}", callback_data=f"adm:fabset:{pid}:{k}")] for k, lab in _kinds]
+            + ([] if _textile else [[InlineKeyboardButton("➕ Add a new fabric", callback_data=f"adm:fabnew:{pid}")]]
+               + ([[InlineKeyboardButton("🙈 Remove a fabric I added", callback_data=f"adm:fabmgr:{pid}")]] if len(FABRICS) > len(_BASE_FABRICS) else []))
             + [[InlineKeyboardButton("⬅️ Back", callback_data=f"adm:editp:{pid}")]]))
+        return
+
+    if data.startswith("adm:fabnew:"):
+        pid = data.split(":", 2)[2]
+        context.user_data["admin_setting"] = {"key": "newfabric", "pid": pid}
+        await safe_edit_query(query, "➕ Type the name of the new fabric, e.g. *Crepe*.\n\nThe three old fabrics are not touched. The new one appears on every Hijab and Jilbab, with the price empty until you set it.",
+                              parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Cancel", callback_data=f"adm:fabp:{pid}")]]))
+        return
+
+    if data.startswith("adm:fabmgr:"):
+        pid = data.split(":", 2)[2]
+        refresh_fabrics(True)
+        mine = [(k, n) for k, n in FABRICS if k not in dict(_BASE_FABRICS)]
+        await safe_edit_query(query, "🙈 Tap a fabric to stop offering it. Old orders keep its name. You can add it again any time by typing the same name.",
+                              reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"🙈 {n}", callback_data=f"adm:fabhide:{k}:{pid}")] for k, n in mine]
+                                                                 + [[InlineKeyboardButton("⬅️ Back", callback_data=f"adm:fabp:{pid}")]]))
+        return
+
+    if data.startswith("adm:fabhide:"):
+        _, _, fk, pid = data.split(":", 3)
+        hide_custom_fabric(fk)
+        await safe_edit_query(query, "✅ Removed from the fabric list.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧵 Fabric Prices", callback_data=f"adm:fabp:{pid}")]]))
         return
 
     if data.startswith("adm:fabset:"):

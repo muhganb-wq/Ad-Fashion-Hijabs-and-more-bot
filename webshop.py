@@ -44,12 +44,32 @@ STATUS_LABEL = {
     "DELIVERY_FAILED": "Delivery failed", "DELIVERED": "Delivered", "CANCELLED": "Cancelled",
 }
 STEPS = ["AWAITING_PAYMENT", "PAID", "PROCESSING", "OUT_FOR_DELIVERY", "DELIVERED"]
-FABRICS = [("dk", "Dan Kaduna Fabric"), ("zm", "Zoom Fabric"), ("eg", "Egyptian Fabric")]
+_BASE_FABRICS = [("dk", "Dan Kaduna Fabric"), ("zm", "Zoom Fabric"), ("eg", "Egyptian Fabric")]
+FABRICS = list(_BASE_FABRICS)       # the three built-in fabrics + any fabric the admin adds (table custom_fabrics)
 # Textiles are sold per yard or per trouser (each with its own price); quantity may be a decimal (2.5 yards).
 UNITS = [("yd", "Per yard"), ("tr", "Per trouser")]
 UNIT_WORD = {"yd": "yard", "tr": "trouser"}
 ALL_PRICE_KEYS = FABRICS + UNITS
 FABRIC_NAME = dict(ALL_PRICE_KEYS)
+_FAB_STAMP = [0.0]
+
+
+def refresh_fabrics(force=False):
+    """Load the fabrics the admin added. The lists are changed in place so every part of the app sees them."""
+    if not force and time.time() - _FAB_STAMP[0] < 3:
+        return
+    _FAB_STAMP[0] = time.time()
+    try:
+        c = sqlite3.connect(CFG["DB"])
+        rows = c.execute("SELECT key,name,active FROM custom_fabrics ORDER BY position,rowid").fetchall()
+        c.close()
+    except Exception:
+        return
+    FABRICS[:] = list(_BASE_FABRICS) + [(k, n) for k, n, a in rows if a]
+    ALL_PRICE_KEYS[:] = FABRICS + UNITS
+    FABRIC_NAME.clear()
+    FABRIC_NAME.update(dict(_BASE_FABRICS + UNITS))
+    FABRIC_NAME.update({k: n for k, n, a in rows})            # hidden fabrics keep their name for old orders
 
 
 def is_unit_key(k):
@@ -169,6 +189,7 @@ def init_web_db():
             picked TEXT DEFAULT '[]', caps TEXT DEFAULT '{}', take INTEGER DEFAULT 0, status TEXT DEFAULT 'queued',
             result TEXT DEFAULT '[]', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, finished_at TIMESTAMP);
         CREATE TABLE IF NOT EXISTS wa_sent(user_id INTEGER PRIMARY KEY, sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+        CREATE TABLE IF NOT EXISTS custom_fabrics(key TEXT PRIMARY KEY, name TEXT NOT NULL, active INTEGER DEFAULT 1, position INTEGER DEFAULT 0);
         CREATE INDEX IF NOT EXISTS idx_notif_user ON notifications(user_id, is_read);
     """)
 
@@ -178,6 +199,7 @@ def init_web_db():
             c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
     addcol("orders", "web_user_id", "INTEGER")
     addcol("products", "sold_out", "INTEGER DEFAULT 0")
+    addcol("product_photos", "sold_out", "INTEGER DEFAULT 0")
     addcol("orders", "received_confirmed", "INTEGER DEFAULT 0")
     addcol("social_posts", "caption", "TEXT DEFAULT ''")
     addcol("social_posts", "auto", "INTEGER DEFAULT 0")
@@ -410,16 +432,17 @@ def products(category=None, q=None, sub=None):
 
 def product_photos(pid):
     rows = db().execute(
-        "SELECT id,file_id,label FROM product_photos WHERE product_id=? ORDER BY position,id", (pid,)).fetchall()
-    out = [{"id": r["id"], "file_id": r["file_id"], "label": r["label"] or ""} for r in rows]
+        "SELECT id,file_id,label,COALESCE(sold_out,0) AS so FROM product_photos WHERE product_id=? ORDER BY position,id", (pid,)).fetchall()
+    out = [{"id": r["id"], "file_id": r["file_id"], "label": r["label"] or "", "sold_out": r["so"]} for r in rows]
     if not out:
         r = db().execute("SELECT photo_file_id FROM products WHERE id=?", (pid,)).fetchone()
         if r and r["photo_file_id"]:
-            out = [{"id": 0, "file_id": r["photo_file_id"], "label": ""}]
+            out = [{"id": 0, "file_id": r["photo_file_id"], "label": "", "sold_out": 0}]
     return out
 
 
 def fabric_prices(pid):
+    refresh_fabrics()
     rows = db().execute("SELECT fabric,price FROM product_fabric_prices WHERE product_id=? AND price>0", (pid,)).fetchall()
     have = {r["fabric"]: r["price"] for r in rows}
     return {k: have[k] for k, _ in ALL_PRICE_KEYS if k in have}
@@ -1725,6 +1748,7 @@ def product_card(pid):
         abort(404)
     from PIL import Image, ImageDraw
     ph = product_photos(pid)
+    ph = [x for x in ph if not x["sold_out"]] or ph
     path = fetch_file(ph[0]["file_id"]) if ph else None
     W = 1080
     try:
@@ -1781,8 +1805,9 @@ def product(pid):
     share_msg = share_text(p)
     return page(p["name"], """
 <div class="two"><div>
-<div class="gal" id="gal">{% for ph in photos %}<figure><img src="{{ url_for('web.img', fid=ph.file_id) }}" alt="">
-{% if ph.label %}<figcaption>{{ ph.label }}</figcaption>{% endif %}</figure>{% else %}<figure><img alt=""></figure>{% endfor %}</div>
+<div class="gal" id="gal">{% for ph in photos %}<figure style="position:relative"><img src="{{ url_for('web.img', fid=ph.file_id) }}" alt="" {% if ph.sold_out %}style="opacity:.55"{% endif %}>
+{% if ph.sold_out %}<span class="nb" style="background:#b3261e;color:#fff;left:10px;right:auto;top:10px">SOLD OUT</span>{% endif %}
+{% if ph.label %}<figcaption>{{ ph.label }}{% if ph.sold_out %} · sold out{% endif %}</figcaption>{% endif %}</figure>{% else %}<figure><img alt=""></figure>{% endfor %}</div>
 {% if photos|length>1 %}<div class="dots" id="dots">{% for ph in photos %}<i class="{{ 'on' if loop.first }}"></i>{% endfor %}</div>
 <p class="mut small" style="text-align:center;margin:0">Swipe to see all {{ photos|length }} photos →</p>{% endif %}
 </div><div>
@@ -2652,12 +2677,17 @@ def admin_product(pid):
 <label class="l">Label for these photos (e.g. a colour name) — optional</label><input name="label" placeholder="Royal Blue">
 <label class="opt" style="margin-top:12px"><input type="checkbox" name="active" value="1" {{ 'checked' if is_new or p['active'] }}><span>Visible in the shop</span></label>
 <p><button class="btn gold block">Save product</button></p></form>
+<form method="post" action="{{ url_for('web.admin_fabric_add') }}" class="card" style="padding:14px;margin-top:12px"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="pid" value="{{ 'new' if is_new else p['id'] }}">
+<b>🧵 Add a new fabric</b><p class="mut small" style="margin:4px 0 8px">For Hijabs &amp; Jilbabs. Dan Kaduna, Zoom and Egyptian stay exactly as they are. The new fabric shows on every product with an empty price until you set it.</p>
+<div class="row" style="flex-wrap:nowrap"><input name="fname" placeholder="e.g. Crepe" maxlength="30" required><button class="btn alt sm">Add</button></div>
+{% if mine %}<div class="small mut" style="margin-top:8px">Fabrics you added: {% for k,n in mine %}<span class="tag">{{ n }}</span> <button class="btn alt sm" style="padding:2px 8px" formaction="{{ url_for('web.admin_fabric_hide', key=k) }}" formnovalidate onclick="return confirm('Stop offering {{ n }}? Old orders keep it.')">hide</button> {% endfor %}</div>{% endif %}</form>
 {% if not is_new %}<form method="post" action="{{ url_for('web.admin_product_soldout', pid=p['id']) }}" style="margin-top:14px"><input type="hidden" name="csrf" value="{{ csrf }}">
 {% if p['sold_out'] %}<p class="tag bad" style="display:block;padding:8px">This product is marked SOLD OUT. Customers cannot order it and it is not auto-posted.</p><button class="btn gold block">✅ Back in stock (restock)</button>
 {% else %}<button class="btn alt block" onclick="return confirm('Mark this product as sold out?')">🚫 Mark as sold out</button>{% endif %}</form>
 <h3>Gallery ({{ photos|length }})</h3>
 <div class="grid">{% for ph in photos %}<div class="card"><img src="{{ url_for('web.img', fid=ph.file_id) }}" style="width:100%;aspect-ratio:1;object-fit:cover;display:block" alt="">
-<div class="b" style="padding:8px"><div class="small">{{ ph.label or 'no label' }}{% if loop.first %} · cover{% endif %}</div>
+<div class="b" style="padding:8px"><div class="small">{{ ph.label or 'no label' }}{% if loop.first %} · cover{% endif %}{% if ph.sold_out %} <span class="tag bad">Sold out</span>{% endif %}</div>
+{% if ph.id %}<form method="post" action="{{ url_for('web.admin_photo_soldout', phid=ph.id) }}" style="margin-top:6px"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="pid" value="{{ p['id'] }}"><button class="btn {{ 'gold' if ph.sold_out else 'alt' }} sm block">{{ '✅ Restock this colour' if ph.sold_out else '🚫 Mark sold out' }}</button></form>{% endif %}
 {% if ph.id %}<div class="row" style="margin-top:6px">{% if not loop.first %}<form method="post" action="{{ url_for('web.admin_photo_cover', phid=ph.id) }}"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="pid" value="{{ p['id'] }}"><button class="btn alt sm">Make cover</button></form>{% endif %}
 <form method="post" action="{{ url_for('web.admin_photo_delete', phid=ph.id) }}" onsubmit="return confirm('Delete this photo?')"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="pid" value="{{ p['id'] }}"><button class="btn alt sm" style="color:var(--bad)">{{ icon('trash') }}</button></form></div>{% endif %}</div></div>{% endfor %}</div>
 <form method="post" action="{{ url_for('web.admin_product_delete', pid=p['id']) }}" onsubmit="return confirm('Hide this product from the shop?')" style="margin-top:20px"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn bad block">Hide product from shop</button></form>{% endif %}
@@ -2667,7 +2697,8 @@ function sync(){var c=ce.value;document.getElementById('fabs').style.display=cs.
 for(var i=0;i<se.options.length;i++){var o=se.options[i];if(!o.dataset.cat)continue;var ok=o.dataset.cat==c;o.hidden=!ok;o.disabled=!ok;if(!ok&&o.selected)se.value='';}}
 ce.addEventListener('change',sync);sync();
 </script>""", p=p, is_new=is_new, cats=cats(), subs=CFG.get("SUBCATEGORIES", {}), clean=clean_label, photos=photos,
-                      fp=fp, fabrics=FABRICS, units=UNITS, color_cats=sorted(color_categories()))
+                      fp=fp, fabrics=FABRICS, units=UNITS, color_cats=sorted(color_categories()),
+                      mine=[(k, n) for k, n in FABRICS if k not in dict(_BASE_FABRICS)])
 
 
 @bp.post("/admin/photo/<int:phid>/delete")
@@ -2689,6 +2720,50 @@ def admin_photo_cover(phid):
     sync_cover(pid)
     db().commit()
     return redirect(url_for("web.admin_product", pid=pid))
+
+
+@bp.post("/admin/photo/<int:phid>/soldout")
+@admin_required
+def admin_photo_soldout(phid):
+    pid = request.form.get("pid", "")
+    db().execute("UPDATE product_photos SET sold_out=1-COALESCE(sold_out,0) WHERE id=? AND product_id=?", (phid, pid))
+    db().commit()
+    return redirect(url_for("web.admin_product", pid=pid))
+
+
+@bp.post("/admin/fabric/add")
+@admin_required
+def admin_fabric_add():
+    pid = request.form.get("pid", "new")
+    name = re.sub(r"\s+", " ", request.form.get("fname", "").strip())[:30]
+    if len(name) < 2:
+        flash("Please type the fabric name, e.g. Crepe.")
+    else:
+        label = name if name.lower().endswith("fabric") else name + " Fabric"
+        refresh_fabrics(True)
+        old = next((k for k, n in FABRIC_NAME.items() if n.lower() == label.lower()), None)
+        if old:
+            db().execute("UPDATE custom_fabrics SET active=1 WHERE key=?", (old,))
+        else:
+            base = "x" + (re.sub(r"[^a-z0-9]", "", name.lower())[:8] or "f")
+            key, i = base, 1
+            while key in FABRIC_NAME:
+                i += 1; key = f"{base}{i}"
+            db().execute("INSERT INTO custom_fabrics(key,name,active,position) VALUES(?,?,1,(SELECT COALESCE(MAX(position),0)+1 FROM custom_fabrics))", (key, label))
+        db().commit()
+        refresh_fabrics(True)
+        flash(f"{label} added. Set its price on each product.")
+    return redirect(url_for("web.admin_product", pid=pid))
+
+
+@bp.post("/admin/fabric/<key>/hide")
+@admin_required
+def admin_fabric_hide(key):
+    db().execute("UPDATE custom_fabrics SET active=0 WHERE key=?", (key,))
+    db().commit()
+    refresh_fabrics(True)
+    flash("Fabric hidden. Old orders keep its name.")
+    return redirect(url_for("web.admin_product", pid=request.form.get("pid", "new")))
 
 
 @bp.post("/admin/product/<pid>/soldout")
@@ -3432,7 +3507,7 @@ def post_instagram(img_urls, caption):
 
 
 def share_photos(pid):
-    return [x["file_id"] for x in product_photos(pid)][:10]
+    return [x["file_id"] for x in product_photos(pid) if not x["sold_out"]][:10]      # finished colours are not advertised
 
 
 def do_share(p, picked, want, caps=None, auto=0):
@@ -4105,6 +4180,7 @@ def register(flask_app, cfg):
     from werkzeug.middleware.proxy_fix import ProxyFix
     CFG.update(cfg)
     init_web_db()
+    refresh_fabrics(True)
     # A stable secret key (kept in the database volume) so people stay signed in across redeploys.
     secret = os.environ.get("SECRET_KEY")
     if not secret:
