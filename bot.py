@@ -238,6 +238,8 @@ def init_db():
         c.execute("ALTER TABLE products ADD COLUMN features TEXT DEFAULT ''")
     if "subcategory" not in product_cols:
         c.execute("ALTER TABLE products ADD COLUMN subcategory TEXT DEFAULT ''")
+    if "sold_out" not in product_cols:
+        c.execute("ALTER TABLE products ADD COLUMN sold_out INTEGER DEFAULT 0")
     if "video_file_id" not in product_cols:
         c.execute("ALTER TABLE products ADD COLUMN video_file_id TEXT DEFAULT ''" )
     if "payment_notified" not in existing_cols:
@@ -656,7 +658,7 @@ def category_menu(category, subcategory=None, show_subs=True):
     for product in rows:
         buttons.append([
             InlineKeyboardButton(
-                f"{product['name']} — {display_price(product)}",
+                f"{'🚫 ' if product['sold_out'] else ''}{product['name']} — {'SOLD OUT' if product['sold_out'] else display_price(product)}",
                 callback_data=f"product:{product['id']}",
             )
         ])
@@ -2215,9 +2217,20 @@ async def add_unit_item(update, context, pid, key, qty, mode):
 
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-
     data = query.data
+
+    # sold-out guard: nobody can start a purchase of a finished product
+    _bp = data.split(":")
+    if len(_bp) > 1 and _bp[0] in ("addcart", "ordernow", "ubuy", "uunit", "uq", "uqtype", "plainqty",
+                                    "plainorder", "colors", "qty", "qtychoose"):
+        try:
+            _sp = get_product(_bp[1])
+            if _sp and _sp["sold_out"]:
+                await query.answer("🚫 Sorry, this product is sold out for now. We will announce when it is back.", show_alert=True)
+                return
+        except Exception:
+            pass
+    await query.answer()
 
     if data == "home":
         await safe_edit_query(query, 
@@ -2266,7 +2279,12 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         category = (product["category"] or "").strip().lower()
-        if category in COLOR_FABRIC_CATEGORIES:
+        if product["sold_out"]:
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🚫 Sold out for now", callback_data=f"product:{product['id']}")],
+                [InlineKeyboardButton("⬅️ Back", callback_data=f"cat:{product['category']}")],
+            ])
+        elif category in COLOR_FABRIC_CATEGORIES:
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🧵 Choose Fabric & Color" if get_fabric_prices(product['id']) else "🎨 Choose Color / Fabric", callback_data=f"colors:{product['id']}")],
                 [InlineKeyboardButton("⬅️ Back", callback_data=f"cat:{product['category']}")],
@@ -2284,7 +2302,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("⬅️ Back", callback_data=f"cat:{product['category']}")],
             ])
 
-        details = [f"*{md_escape(product['name'])}*", "", md_escape(product["description"] or "")]
+        details = [f"*{md_escape(product['name'])}*"] + (["", "🚫 *SOLD OUT for now*"] if product["sold_out"] else []) + ["", md_escape(product["description"] or "")]
         if product["variety"]:
             details += ["", f"🎨 *Variety:* {md_escape(product['variety'])}"]
         if product["features"]:
@@ -3665,6 +3683,7 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
             [InlineKeyboardButton("📸 Main Photo", callback_data=f"adm:editphoto:{product_id}")],
             [InlineKeyboardButton("🎥 Product Video", callback_data=f"adm:editvideo:{product_id}")],
             [InlineKeyboardButton("🗑️ Remove Video", callback_data=f"adm:removevideo:{product_id}")],
+            [InlineKeyboardButton("✅ Back in stock (restock)" if product["sold_out"] else "🚫 Mark as sold out", callback_data=f"adm:soldout:{product_id}")],
             [InlineKeyboardButton("⬅️ Back", callback_data="adm:editproduct")],
         ]
         await safe_edit_query(query, 
@@ -3672,6 +3691,32 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup(buttons),
         )
+        return
+
+    if data.startswith("adm:soldout:"):
+        product_id = data.split(":", 2)[2]
+        product = get_product(product_id)
+        if not product:
+            await safe_edit_query(query, "⚠️ Product not found.", reply_markup=admin_back_button())
+            return
+        now_sold = 0 if product["sold_out"] else 1
+        c = conn()
+        c.execute("UPDATE products SET sold_out=? WHERE id=?", (now_sold, product_id))
+        c.commit(); c.close()
+        if not now_sold:
+            try:
+                cc = sqlite3.connect(DB)
+                ids = [r[0] for r in cc.execute("SELECT user_id FROM web_wishlist WHERE product_id=?", (product_id,))]
+                cc.close()
+                if ids:
+                    import webshop
+                    webshop.push_users(ids, "Back in stock 🎉", f"{product['name']} is available again.", f"/p/{product_id}")
+            except Exception:
+                pass
+        await safe_edit_query(query,
+            ("🚫 *%s* is now marked SOLD OUT." if now_sold else "✅ *%s* is back in stock.") % md_escape(product["name"]),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data=f"adm:editp:{product_id}")]]))
         return
 
     if data.startswith("adm:editvideo:"):

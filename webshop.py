@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 from functools import wraps
 
 from flask import (
-    Blueprint, abort, flash, g, has_request_context, redirect, render_template_string,
+    Blueprint, abort, current_app, flash, g, has_request_context, redirect, render_template_string,
     request, send_file, session, url_for, Response,
 )
 from markupsafe import Markup
@@ -177,6 +177,7 @@ def init_web_db():
         if cols and col not in cols:
             c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
     addcol("orders", "web_user_id", "INTEGER")
+    addcol("products", "sold_out", "INTEGER DEFAULT 0")
     addcol("orders", "received_confirmed", "INTEGER DEFAULT 0")
     addcol("social_posts", "caption", "TEXT DEFAULT ''")
     addcol("social_posts", "auto", "INTEGER DEFAULT 0")
@@ -1122,6 +1123,7 @@ main{max-width:1000px;margin:auto;padding:16px 14px}
 nav.tabs{position:fixed;left:0;right:0;bottom:0;z-index:30;background:var(--card);border-top:1px solid var(--line);display:flex;justify-content:space-around;padding:6px 4px calc(6px + env(safe-area-inset-bottom))}
 nav.tabs a{flex:1;max-width:120px;text-decoration:none;color:var(--mut);display:flex;flex-direction:column;align-items:center;gap:2px;font-size:11px;font-weight:500;padding:4px 0}
 nav.tabs a.on{color:var(--gold);font-weight:700}
+nav.tabs.adm a{font-size:9.5px;max-width:80px}nav.tabs.adm a svg{width:21px;height:21px}
 .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
 @media(min-width:620px){.grid{grid-template-columns:repeat(3,1fr)}}@media(min-width:900px){.grid{grid-template-columns:repeat(4,1fr)}}
 .card{background:var(--card);border:1px solid var(--line);border-radius:16px;overflow:hidden}
@@ -1201,8 +1203,8 @@ table{width:100%;border-collapse:collapse}td,th{padding:10px 6px;border-bottom:1
 {% endif %}
 <main>{% for m in get_flashed_messages() %}<div class="flash">{{ m }}</div>{% endfor %}{{ body|safe }}</main>
 {% if user %}
-<nav class="tabs">
-{% for key,label,ep in [('home','Home','web.home'),('shop','Shop','web.shop'),('news','News','web.news'),('orders','My Orders','web.orders'),('user','Profile','web.profile')] %}
+<nav class="tabs{{ ' adm' if is_admin }}">
+{% for key,label,ep in [('home','Home','web.home'),('shop','Shop','web.shop'),('news','News','web.news'),('orders','My Orders','web.orders'),('user','Profile','web.profile')] + ([('admin','Admin','web.admin_home'),('share','Share','web.admin_share')] if is_admin else []) %}
 <a href="{{ url_for(ep) }}" class="{{ 'on' if tab==key }}">{{ icon(key) }}<span>{{ label }}</span></a>{% endfor %}
 </nav>{% endif %}
 <div id="pushbar" style="display:none;position:fixed;left:12px;right:12px;bottom:90px;background:#111;color:#e6c36b;padding:12px 16px;border-radius:14px;z-index:41;align-items:center;gap:12px;border:1px solid var(--gold)"><span style="flex:1;font-size:14px">🔔 Get updates about your orders, offers and news</span><button class="btn gold sm" id="pushon">Turn on</button><button id="pushx" style="border:0;background:none;color:#e6c36b;font-size:18px">✕</button></div>
@@ -1233,9 +1235,16 @@ if(ok){
 var dp=null;window.addEventListener('beforeinstallprompt',function(e){e.preventDefault();dp=e;var b=document.getElementById('inst');var x=false;try{x=sessionStorage.getItem('instx')}catch(_){}if(!x)b.style.display='flex';});
 document.getElementById('instbtn').onclick=function(){if(dp){dp.prompt();dp=null;}document.getElementById('inst').style.display='none';};
 document.getElementById('instx').onclick=function(){document.getElementById('inst').style.display='none';try{sessionStorage.setItem('instx','1')}catch(e){}};
+function shareCard(b){var card=b.getAttribute('data-card'),text=b.getAttribute('data-text')||'';b.disabled=true;var old=b.innerHTML;b.innerHTML='Preparing…';
+function done(){b.disabled=false;b.innerHTML=old}
+function fallback(){window.open('https://wa.me/?text='+encodeURIComponent(text),'_blank');done()}
+fetch(card,{credentials:'same-origin'}).then(function(r){if(!r.ok)throw 0;return r.blob()}).then(function(bl){
+var f=new File([bl],'product.jpg',{type:'image/jpeg'});
+if(navigator.canShare&&navigator.canShare({files:[f]})){return navigator.share({files:[f],text:text}).then(done,function(e){if(e&&e.name==='AbortError')done();else fallback()})}
+var a=document.createElement('a');a.href=URL.createObjectURL(bl);a.download='product.jpg';document.body.appendChild(a);a.click();a.remove();setTimeout(fallback,400)}).catch(fallback)}
 </script></body></html>"""
 
-PCARD = """{% macro pcard(p) %}<a class="card pc" href="{{ url_for('web.product', pid=p['id']) }}">{% if p['is_new'] %}<span class="nb">NEW</span>{% endif %}
+PCARD = """{% macro pcard(p) %}<a class="card pc" href="{{ url_for('web.product', pid=p['id']) }}">{% if p['sold_out'] %}<span class="nb" style="background:#b3261e;color:#fff">SOLD OUT</span>{% elif p['is_new'] %}<span class="nb">NEW</span>{% endif %}
 {% if p['photo_file_id'] %}<img loading="lazy" src="{{ url_for('web.img', fid=p['photo_file_id']) }}" alt="{{ p['name'] }}">{% else %}<img alt="">{% endif %}
 <div class="b"><div class="t">{{ p['name'] }}</div><div class="price">{{ display_price(p) }}</div></div></a>{% endmacro %}"""
 
@@ -1687,6 +1696,76 @@ def shop():
                 tab="shop", items=items, cats=cats(), c=c, q=q, subs=subs, sub=sub, clean=clean_label)
 
 
+def share_text(p):
+    """The words that travel with the picture on WhatsApp: name, every price, a short description, the link."""
+    lines = [f"*{p['name']}*"]
+    if p["sold_out"]:
+        lines.append("🚫 Sold out for now")
+    pr = fabric_prices(p["id"])
+    if pr:
+        lines += [f"• {FABRIC_NAME[k]}: {money(v)}" for k, v in pr.items()]
+    elif p["price"]:
+        lines.append(f"Price: {money(p['price'])}")
+    else:
+        lines.append("Price on request")
+    if p["description"]:
+        lines.append((p["description"] or "").strip()[:160])
+    if p["variety"]:
+        lines.append(f"🎨 {p['variety']}"[:100])
+    lines.append(f"🛍️ Order here: {url_for('web.product', pid=p['id'], _external=True)}")
+    lines.append(f"— {APP_NAME}")
+    return "\n".join(lines)
+
+
+@bp.get("/p/<pid>/card.jpg")
+def product_card(pid):
+    """A ready-to-share picture: the product photo with its name and prices underneath."""
+    p = db().execute("SELECT * FROM products WHERE id=? AND active=1", (pid,)).fetchone()
+    if not p:
+        abort(404)
+    from PIL import Image, ImageDraw
+    ph = product_photos(pid)
+    path = fetch_file(ph[0]["file_id"]) if ph else None
+    W = 1080
+    try:
+        pic = Image.open(path).convert("RGB")
+    except Exception:
+        pic = Image.new("RGB", (W, W), (240, 236, 228))
+    sc = min(W / pic.size[0], 1350 / pic.size[1])
+    pic = pic.resize((max(1, int(pic.size[0] * sc)), max(1, int(pic.size[1] * sc))))
+    rows = [(FABRIC_NAME[k].replace(" Fabric", ""), money(v)) for k, v in fabric_prices(pid).items()]
+    if not rows:
+        rows = [("", money(p["price"]))]
+    fn, fl, fa = _font(50), _font(40, bold=False), _font(44)
+    foot = 40 + 70 + len(rows) * 62 + 30 + 46 + 30
+    im = Image.new("RGB", (W, pic.size[1] + foot), (255, 255, 255))
+    im.paste(pic, ((W - pic.size[0]) // 2, 0))
+    d = ImageDraw.Draw(im)
+    y0 = pic.size[1]
+    d.rectangle((0, y0, W, y0 + foot), fill=(17, 17, 17))
+    d.rectangle((0, y0, W, y0 + 8), fill=(201, 162, 75))
+    y = y0 + 34
+    name = p["name"]
+    while d.textlength(name, font=fn) > W - 80 and len(name) > 6:
+        name = name[:-2]
+    d.text((40, y), name + ("…" if name != p["name"] else ""), font=fn, fill=(255, 255, 255))
+    y += 80
+    for lab, amt in rows:
+        if lab:
+            d.text((40, y), lab, font=fl, fill=(230, 230, 230))
+            d.text((W - 40 - d.textlength(amt, font=fa), y - 3), amt, font=fa, fill=(230, 195, 107))
+        else:
+            d.text((40, y - 3), amt, font=fa, fill=(230, 195, 107))
+        y += 62
+    d.text((40, y + 14), APP_NAME, font=_font(30, bold=False), fill=(170, 170, 170))
+    if p["sold_out"]:
+        d.rounded_rectangle((W - 330, 24, W - 24, 100), radius=18, fill=(179, 38, 30))
+        d.text((W - 305, 40), "SOLD OUT", font=_font(40), fill=(255, 255, 255))
+    buf = io.BytesIO()
+    im.save(buf, "JPEG", quality=88)
+    return Response(buf.getvalue(), mimetype="image/jpeg", headers={"Cache-Control": "no-cache"})
+
+
 @bp.get("/p/<pid>")
 def product(pid):
     p = db().execute("SELECT * FROM products WHERE id=? AND active=1", (pid,)).fetchone()
@@ -1699,7 +1778,7 @@ def product(pid):
     by_unit = bool(fp) and not is_color_cat
     u = current_user()
     wished = bool(db().execute("SELECT 1 FROM web_wishlist WHERE user_id=? AND product_id=?", (u["id"], pid)).fetchone())
-    share = f"https://wa.me/?text={urllib.parse.quote(p['name'] + ' — ' + request.url)}"
+    share_msg = share_text(p)
     return page(p["name"], """
 <div class="two"><div>
 <div class="gal" id="gal">{% for ph in photos %}<figure><img src="{{ url_for('web.img', fid=ph.file_id) }}" alt="">
@@ -1721,8 +1800,9 @@ def product(pid):
 <label class="l" id="qlab">{{ 'How many?' if by_unit else 'Quantity' }}</label>
 <div class="qty"><button type="button" onclick="st(-1)">−</button><input type="number" name="qty" id="qty" value="1" min="{{ 0.25 if by_unit else 1 }}" max="500" step="{{ 0.25 if by_unit else 1 }}" inputmode="{{ 'decimal' if by_unit else 'numeric' }}" oninput="upd()"><button type="button" onclick="st(1)">+</button></div>
 {% if by_unit %}<p class="mut small" style="margin:.4em 0 0">You can use decimals, for example 2.5.</p>{% endif %}
-<div class="row" style="margin-top:18px"><button class="btn gold grow">{{ icon('cart') }} Add to cart</button>
-<a class="btn wa" href="{{ share }}" target="_blank" rel="noopener">Share</a></div></form>
+{% if p['sold_out'] %}<p class="tag bad" style="display:block;margin-top:14px;padding:10px;text-align:center"><b>Sold out for now</b> — save it and we will tell you when it is back in stock.</p>{% endif %}
+<div class="row" style="margin-top:18px">{% if p['sold_out'] %}<button class="btn grow" type="button" disabled style="opacity:.5">Sold out</button>{% else %}<button class="btn gold grow">{{ icon('cart') }} Add to cart</button>{% endif %}
+<button type="button" class="btn wa" data-card="{{ url_for('web.product_card', pid=p['id']) }}" data-text="{{ share_msg }}" onclick="shareCard(this)">Share</button></div></form>
 <form method="post" action="{{ url_for('web.wish', pid=p['id']) }}" style="margin-top:10px"><input type="hidden" name="csrf" value="{{ csrf }}">
 <button class="btn alt sm">{{ icon('heart') }} {{ 'Saved to wishlist' if wished else 'Save for later' }}</button></form>
 </div></div>
@@ -1736,7 +1816,7 @@ function st(n){var i=document.getElementById('qty');if(UNIT){i.value=Math.min(50
 document.querySelectorAll('input[name=fabric]').forEach(function(r){r.addEventListener('change',upd)});if(Object.keys(FP).length)upd();
 var g=document.getElementById('gal'),ds=document.querySelectorAll('#dots i');
 if(g&&ds.length){g.addEventListener('scroll',function(){var i=Math.round(g.scrollLeft/g.clientWidth);ds.forEach(function(d,k){d.className=k==i?'on':''})});}
-</script>""", tab="shop", p=p, photos=photos, colors=colors, fp=fp, wished=wished, share=share, by_unit=by_unit)
+</script>""", tab="shop", p=p, photos=photos, colors=colors, fp=fp, wished=wished, share_msg=share_msg, by_unit=by_unit)
 
 
 @bp.post("/wish/<pid>")
@@ -1765,6 +1845,9 @@ def cart_add():
     p = db().execute("SELECT * FROM products WHERE id=? AND active=1", (pid,)).fetchone()
     if not p:
         abort(404)
+    if p["sold_out"]:
+        flash("Sorry, this product is sold out for now. Save it and we will tell you when it is back.")
+        return redirect(url_for("web.product", pid=pid))
     is_color_cat = (p["category"] or "").lower() in color_categories()
     unit_fp = {} if is_color_cat else {k: v for k, v in fabric_prices(pid).items() if is_unit_key(k)}
     fab, cid = None, None
@@ -1851,6 +1934,10 @@ def checkout():
     u = current_user()
     if setting("accepting_orders", "1") == "0":
         flash("We are not accepting new orders right now. Please check back soon.")
+        return redirect(url_for("web.cart_view"))
+    gone = [i["p"]["name"] for i in items if i["p"]["sold_out"]]
+    if gone:
+        flash("Sold out meanwhile: " + ", ".join(gone) + ". Please remove it from your cart to continue.")
         return redirect(url_for("web.cart_view"))
     if request.method == "POST":
         method = request.form.get("method", "pickup")
@@ -2252,7 +2339,8 @@ ADMIN_NAV = """<div class="pills" style="margin-bottom:6px">
 
 
 def admin_page(title, body, **ctx):
-    return page(title, ADMIN_NAV + body, tab="", **ctx)
+    tab = "share" if title.startswith(("Share", "Reel", "Connect")) else "admin"
+    return page(title, ADMIN_NAV + body, tab=tab, **ctx)
 
 
 def reload_cats():
@@ -2485,7 +2573,7 @@ def admin_products():
 <form method="get" class="row" style="flex-wrap:nowrap;margin:8px 0"><input name="q" value="{{ q }}" placeholder="Search products"><button class="btn sm">Search</button></form>
 {% for p in rows %}<a class="card li" href="{{ url_for('web.admin_product', pid=p['id']) }}" style="margin-bottom:8px;text-decoration:none;{{ 'opacity:.5' if not p['active'] }}">
 {% if p['photo_file_id'] %}<img class="th" src="{{ url_for('web.img', fid=p['photo_file_id']) }}" alt="">{% else %}<div class="th"></div>{% endif %}
-<div class="grow"><b>{{ p['name'] }}</b>{% if not p['active'] %} <span class="tag bad">Hidden</span>{% endif %}<div class="small mut">{{ cats.get(p['category'], p['category']) }}</div><div class="price">{{ display_price(p) }}</div></div></a>{% endfor %}
+<div class="grow"><b>{{ p['name'] }}</b>{% if not p['active'] %} <span class="tag bad">Hidden</span>{% endif %}{% if p['sold_out'] %} <span class="tag bad">Sold out</span>{% endif %}<div class="small mut">{{ cats.get(p['category'], p['category']) }}</div><div class="price">{{ display_price(p) }}</div></div></a>{% endfor %}
 {% if not rows %}<p class="mut">No products.</p>{% endif %}""", rows=rows, q=q, cats=cats())
 
 
@@ -2564,7 +2652,10 @@ def admin_product(pid):
 <label class="l">Label for these photos (e.g. a colour name) — optional</label><input name="label" placeholder="Royal Blue">
 <label class="opt" style="margin-top:12px"><input type="checkbox" name="active" value="1" {{ 'checked' if is_new or p['active'] }}><span>Visible in the shop</span></label>
 <p><button class="btn gold block">Save product</button></p></form>
-{% if not is_new %}<h3>Gallery ({{ photos|length }})</h3>
+{% if not is_new %}<form method="post" action="{{ url_for('web.admin_product_soldout', pid=p['id']) }}" style="margin-top:14px"><input type="hidden" name="csrf" value="{{ csrf }}">
+{% if p['sold_out'] %}<p class="tag bad" style="display:block;padding:8px">This product is marked SOLD OUT. Customers cannot order it and it is not auto-posted.</p><button class="btn gold block">✅ Back in stock (restock)</button>
+{% else %}<button class="btn alt block" onclick="return confirm('Mark this product as sold out?')">🚫 Mark as sold out</button>{% endif %}</form>
+<h3>Gallery ({{ photos|length }})</h3>
 <div class="grid">{% for ph in photos %}<div class="card"><img src="{{ url_for('web.img', fid=ph.file_id) }}" style="width:100%;aspect-ratio:1;object-fit:cover;display:block" alt="">
 <div class="b" style="padding:8px"><div class="small">{{ ph.label or 'no label' }}{% if loop.first %} · cover{% endif %}</div>
 {% if ph.id %}<div class="row" style="margin-top:6px">{% if not loop.first %}<form method="post" action="{{ url_for('web.admin_photo_cover', phid=ph.id) }}"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="pid" value="{{ p['id'] }}"><button class="btn alt sm">Make cover</button></form>{% endif %}
@@ -2598,6 +2689,32 @@ def admin_photo_cover(phid):
     sync_cover(pid)
     db().commit()
     return redirect(url_for("web.admin_product", pid=pid))
+
+
+@bp.post("/admin/product/<pid>/soldout")
+@admin_required
+def admin_product_soldout(pid):
+    p = db().execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
+    if not p:
+        abort(404)
+    now_sold = 0 if p["sold_out"] else 1
+    db().execute("UPDATE products SET sold_out=? WHERE id=?", (now_sold, pid)); db().commit()
+    if now_sold:
+        flash("Marked as sold out.")
+    else:
+        flash("Back in stock. Customers who saved it were told.")
+        try:
+            notify_restock(p)
+        except Exception:
+            pass
+    return redirect(url_for("web.admin_product", pid=pid))
+
+
+def notify_restock(p):
+    """Tell everyone who saved this product that it is available again."""
+    rows = db().execute("SELECT user_id FROM web_wishlist WHERE product_id=?", (p["id"],)).fetchall()
+    for r in rows:
+        push_users([r["user_id"]], "Back in stock 🎉", f"{p['name']} is available again.", url_for("web.product", pid=p["id"]))
 
 
 @bp.post("/admin/product/<pid>/delete")
@@ -3438,94 +3555,153 @@ def recent_jobs(limit=5):
     return out
 
 
-# ---- automatic daily posting (morning / afternoon / evening, Nigeria time)
+# ---- automatic posting: a photo post EVERY HOUR and a Reel EVERY 2 HOURS (Nigeria time)
+# Works on its own clock. It does not depend on anyone opening the app, on manual posts, or on restarts.
 LAGOS = timezone(timedelta(hours=1))
-AUTO_DEFAULT_TIMES = "08:00,13:00,19:00"
-AUTO_GRACE_MIN = 120          # a slot is still honoured up to 2 hours late (e.g. after a restart)
-AUTO_QUIET_BEFORE = 90        # you already posted by hand within 90 minutes before the slot: skip it
+PHOTO_MINUTE = 0              # photo posts go out on the hour: 08:00, 09:00 ...
+REEL_MINUTE = 30              # Reels go out at half past every 2nd hour: 00:30, 02:30 ... 22:30
+PHOTO_GRACE_MIN = 50          # a slot is still honoured up to 50 minutes late (after a restart or a failed try)
+REEL_GRACE_MIN = 90
+AUTO_TRIES = 3                # a failed slot is retried (5 minutes apart) up to 3 times
+AUTO_RETRY_WAIT = 300
+REEL_HOURS = list(range(0, 24, 2))
+_AUTO_STATE = {"thread": None}
 
 
-def auto_times():
-    out = []
-    for t in (setting("auto_times", AUTO_DEFAULT_TIMES) or "").split(","):
-        m = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*", t)
-        if m and int(m[1]) < 24 and int(m[2]) < 60:
-            out.append(f"{int(m[1]):02d}:{m[2]}")
-    return sorted(set(out))[:6]
+def _hours(key, allowed):
+    """Hours switched OFF are stored; everything else is ON, so new hours are on by default."""
+    off = {int(x) for x in (setting(key, "") or "").split(",") if x.strip().isdigit()}
+    return [h for h in allowed if h not in off]
 
 
-def pick_auto_product():
-    """The product that has waited longest since it was last posted, never the one posted just before."""
-    last = setting("auto_last_pid")
-    rows = db().execute("""SELECT p.*, (SELECT MAX(created_at) FROM social_posts s WHERE s.product_id=p.id AND s.status='ok') AS lp
-                           FROM products p WHERE p.active=1 ORDER BY (lp IS NOT NULL), lp, p.rowid DESC""").fetchall()
-    elig = [r for r in rows if share_photos(r["id"])]
-    nxt = [r for r in elig if r["id"] != last]
-    return (nxt or elig or [None])[0]
+def photo_hours():
+    return _hours("auto_off_hours", list(range(24)))
+
+
+def reel_hours():
+    return _hours("auto_reel_off_hours", REEL_HOURS)
+
+
+def auto_photo_on():
+    return setting("auto_photo_on", "1") == "1"
+
+
+def auto_reel_on():
+    return setting("auto_reel_on", "1") == "1"
+
+
+def _eligible():
+    """Every product that can be posted: visible, in stock, has a photo. New, old, anything in between."""
+    rows = db().execute("SELECT * FROM products WHERE active=1 AND COALESCE(sold_out,0)=0").fetchall()
+    return [r for r in rows if share_photos(r["id"])]
+
+
+def pick_auto_product(kind="photo", pop=False):
+    """Random pick from the WHOLE catalogue using a shuffled deck: every product comes up once before any repeats,
+    and the first product of a new deck is never the one just posted. pop=False only peeks (for the preview)."""
+    import random
+    elig = {r["id"]: r for r in _eligible()}
+    if not elig:
+        return None
+    name = "auto_deck_" + kind
+    try:
+        deck = [x for x in json.loads(setting(name, "[]")) if x in elig]
+    except ValueError:
+        deck = []
+    if not deck:
+        deck = list(elig)
+        random.shuffle(deck)
+        last = setting("auto_last_pid_" + kind)
+        if len(deck) > 1 and deck[0] == last:
+            deck.append(deck.pop(0))
+    pid = deck[0]
+    if pop:
+        set_setting(name, json.dumps(deck[1:]))
+        set_setting("auto_last_pid_" + kind, pid)
+    return elig[pid]
 
 
 def run_auto_post(slot_label="", force=False, reel=False):
-    """Post the next product now (as a Reel when asked). Returns (product or None, messages)."""
+    """Post one random product now (as a Reel when asked). Returns (product or None, messages)."""
     rdy = social_ready()
     want = [pl for pl in ("fb", "ig") if setting("auto_" + pl, "1") == "1" and rdy[pl]]
     if not want:
-        return None, ["Auto-post: connect Facebook or Instagram first."]
+        return None, ["❌ Auto-post: connect Facebook or Instagram first."]
     if not site_base():
-        return None, ["Auto-post: the app address is unknown. Set SITE_URL in Railway or open the Share page once."]
-    p = pick_auto_product()
+        return None, ["❌ Auto-post: the app address is unknown. Set SITE_URL in Railway or open the Share page once."]
+    kind = "reel" if reel else "photo"
+    p = pick_auto_product(kind, pop=True)
     if not p:
-        return None, ["Auto-post: no active product with a photo."]
-    picked = share_photos(p["id"])
-    msgs = None
-    if reel:
-        try:
+        return None, ["❌ Auto-post: no product in stock with a photo."]
+    try:
+        if reel:
             msgs = do_reel(p, make_reel(p), want, auto=1)
-        except Exception as e:                    # no video tool, no photo, ...: still post the photos so the slot is not lost
-            msgs = [f"ℹ️ Reel not possible ({e}). Posted the photos instead."] + do_share(p, picked, want, auto=1)
-    if msgs is None:
-        msgs = do_share(p, picked, want, auto=1)
-    set_setting("auto_last_pid", p["id"])
-    ok = [m for m in msgs if m.startswith("✅")]
-    bad = [m for m in msgs if m.startswith("❌")]
-    title = ("🤖 Auto-posted: " if ok else "⚠️ Auto-post failed: ") + p["name"]
-    body = " · ".join(m for m in msgs if not m.startswith("ℹ️") or "Reel not possible" in m)
-    push_admins(title, body[:180], url="/admin/share", tag="autopost")
+        else:
+            msgs = do_share(p, share_photos(p["id"]), want, auto=1)
+    except Exception as e:
+        msgs = [f"❌ {p['name']}: {e}"]
+    title = ("🤖 Auto-posted: " if any(m.startswith("✅") for m in msgs) else "⚠️ Auto-post failed: ") + p["name"]
+    body = " · ".join(m for m in msgs if not m.startswith("ℹ️"))
+    try:
+        push_admins(title, body[:180], url="/admin/share", tag="autopost")
+    except Exception:
+        pass
     return p, msgs
 
 
-def auto_tick(flask_app, now=None):
-    """Called every minute: run any slot that is due, was not already covered by a manual post, and not yet done today."""
+def _claim(key):
+    """Atomic: True for exactly one caller, even with several workers."""
+    cur = db().execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (key, str(int(time.time()))))
+    db().commit()
+    return cur.rowcount == 1
+
+
+def _due_slots(now):
+    """(kind, slot datetime, grace) for every enabled slot whose time has come."""
+    out = []
+    if auto_photo_on():
+        for h in photo_hours():
+            s = now.replace(hour=h, minute=PHOTO_MINUTE, second=0, microsecond=0)
+            if s <= now < s + timedelta(minutes=PHOTO_GRACE_MIN):
+                out.append(("photo", s))
+    if auto_reel_on():
+        for h in reel_hours():
+            s = now.replace(hour=h, minute=REEL_MINUTE, second=0, microsecond=0)
+            if s <= now < s + timedelta(minutes=REEL_GRACE_MIN):
+                out.append(("reel", s))
+    return out
+
+
+def _slot_key(kind, s):
+    return f"{s:%Y-%m-%d}_{kind}_{s:%H%M}"
+
+
+def _run_slot(flask_app, kind, skey):
     with flask_app.app_context():
+        jid = None
         try:
-            if setting("auto_on", "0") != "1":
-                return []
-            now = now or datetime.now(LAGOS)
-            ran = []
-            for t in auto_times():
-                h, m = map(int, t.split(":"))
-                slot = now.replace(hour=h, minute=m, second=0, microsecond=0)
-                key = f"auto_done_{slot:%Y-%m-%d}_{t}"
-                if not (slot <= now < slot + timedelta(minutes=AUTO_GRACE_MIN)) or setting(key):
-                    continue
-                set_setting(key, "1")                                   # claim first so it can never fire twice
-                cutoff = (slot - timedelta(minutes=AUTO_QUIET_BEFORE)).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                if db().execute("SELECT 1 FROM social_posts WHERE status='ok' AND created_at>=?", (cutoff,)).fetchone():
-                    ran.append((t, "skipped"))
-                    continue
-                is_last = t == auto_times()[-1]
-                reel = setting("auto_reel", "0") == "1" and is_last
-                jid = db().execute("INSERT INTO share_jobs(kind,status) VALUES(?,'working')", ("autoreel" if reel else "auto",)).lastrowid
-                db().commit()
-                p, msgs = run_auto_post(t, reel=reel)
-                good = [m for m in msgs if m.startswith("✅")]
-                bad = [m for m in msgs if m.startswith("❌")] or ([] if good else ["x"])
-                db().execute("UPDATE share_jobs SET product_id=?, status=?, result=?, finished_at=CURRENT_TIMESTAMP WHERE id=?",
-                             (p["id"] if p else "", "done" if good and not bad else ("partial" if good else "failed"), json.dumps(msgs), jid))
-                db().commit()
-                ran.append((t, p["id"] if p else "none"))
-            return ran
-        except Exception:
-            return []
+            jid = db().execute("INSERT INTO share_jobs(kind,status) VALUES(?,'working')", ("autoreel" if kind == "reel" else "auto",)).lastrowid
+            db().commit()
+            p, msgs = run_auto_post(skey, reel=(kind == "reel"))
+            good = [m for m in msgs if m.startswith("✅")]
+            bad = [m for m in msgs if m.startswith("❌")]
+            status = "done" if good and not bad else ("partial" if good else "failed")
+            db().execute("UPDATE share_jobs SET product_id=?, status=?, result=?, finished_at=CURRENT_TIMESTAMP WHERE id=?",
+                         (p["id"] if p else "", status, json.dumps(msgs), jid))
+            if good:
+                set_setting("auto_done_" + skey, "1")
+            set_setting("auto_last", f"{datetime.now(LAGOS):%d %b %H:%M} · {'Reel' if kind == 'reel' else 'Photo'} · "
+                                     f"{p['name'] if p else '-'} · {status}")
+            db().commit()
+        except Exception as e:
+            try:
+                set_setting("auto_err", f"{datetime.now(LAGOS):%d %b %H:%M} {kind}: {e}"[:300])
+                if jid:
+                    db().execute("UPDATE share_jobs SET status='failed', result=?, finished_at=CURRENT_TIMESTAMP WHERE id=?",
+                                 (json.dumps([f"❌ {e}"]), jid))
+                    db().commit()
+            except Exception:
+                pass
         finally:
             try:
                 db().close()
@@ -3533,46 +3709,132 @@ def auto_tick(flask_app, now=None):
                 pass
 
 
+def auto_tick(flask_app, now=None, sync=None):
+    """Runs every 15 seconds. Starts every slot that is due and not yet done. Never depends on any manual action."""
+    sync = JOBS_SYNC if sync is None else sync
+    ran = []
+    with flask_app.app_context():
+        try:
+            now = now or datetime.now(LAGOS)
+            set_setting("auto_beat", str(int(time.time())))               # "I am alive" signal shown on the Share page
+            for kind, s in _due_slots(now):
+                skey = _slot_key(kind, s)
+                if setting("auto_done_" + skey):
+                    continue
+                last = to_int(setting("auto_ts_" + skey, "0"), 0) or 0
+                if last and time.time() - last < AUTO_RETRY_WAIT:
+                    continue
+                n = next((i for i in range(1, AUTO_TRIES + 1) if _claim(f"auto_try{i}_{skey}")), None)
+                if n is None:
+                    continue
+                set_setting("auto_ts_" + skey, str(int(time.time())))
+                ran.append((kind, f"{s:%H:%M}", n))
+                if sync:
+                    _run_slot(flask_app, kind, skey)
+                else:
+                    threading.Thread(target=_run_slot, args=(flask_app, kind, skey), daemon=True, name="auto-" + skey).start()
+            if now.minute % 30 == 7:                                       # tidy old bookkeeping
+                _auto_cleanup(now)
+        except Exception as e:
+            try:
+                set_setting("auto_err", f"{datetime.now(LAGOS):%d %b %H:%M} tick: {e}"[:300])
+            except Exception:
+                pass
+        finally:
+            try:
+                db().close()
+            except Exception:
+                pass
+    return ran
+
+
+def _auto_cleanup(now):
+    cut = (now - timedelta(days=2)).strftime("%Y-%m-%d")
+    for (k,) in db().execute("SELECT key FROM settings WHERE key LIKE 'auto_try%' OR key LIKE 'auto_done_%' OR key LIKE 'auto_ts_%'").fetchall():
+        m = re.search(r"(\d{4}-\d{2}-\d{2})_", k)
+        if m and m.group(1) < cut:
+            db().execute("DELETE FROM settings WHERE key=?", (k,))
+    db().commit()
+
+
+def _autopost_loop(flask_app):
+    while True:
+        try:
+            time.sleep(15)
+            auto_tick(flask_app)
+        except Exception:
+            pass                                                           # the clock must never stop
+
+
 def start_autopost(flask_app):
-    try:                                          # a restart kills running jobs: say so instead of showing "sending" forever
-        c = sqlite3.connect(CFG["DB"])
-        c.execute("UPDATE share_jobs SET status='failed', result=?, finished_at=CURRENT_TIMESTAMP WHERE status IN ('queued','working')",
-                  (json.dumps(["❌ The app restarted while sending. Please tap Post again."]),))
-        c.commit()
-        c.close()
+    """Start the clock once. Called at start-up and again (harmlessly) from every request, so a dead thread comes back."""
+    t = _AUTO_STATE["thread"]
+    if t is not None and t.is_alive():
+        return
+    first = t is None
+    if first:
+        try:                                      # a restart kills running jobs: say so instead of showing "sending" forever
+            c = sqlite3.connect(CFG["DB"])
+            c.execute("UPDATE share_jobs SET status='failed', result=?, finished_at=CURRENT_TIMESTAMP WHERE status IN ('queued','working')",
+                      (json.dumps(["❌ The app restarted while sending. Please tap Post again."]),))
+            c.commit()
+            c.close()
+        except Exception:
+            pass
+        try:
+            with flask_app.app_context():
+                purge_reels(older_minutes=0)      # nothing from before a restart is kept
+        except Exception:
+            pass
+    th = threading.Thread(target=_autopost_loop, args=(flask_app,), daemon=True, name="autopost")
+    _AUTO_STATE["thread"] = th
+    th.start()
+
+
+@bp.before_app_request
+def _keep_clock_alive():
+    try:
+        start_autopost(current_app._get_current_object())
     except Exception:
         pass
 
-    def loop():
-        try:
-            with flask_app.app_context():
-                purge_reels(older_minutes=0)          # nothing from before a restart is kept
-        except Exception:
-            pass
-        while True:
-            time.sleep(15)
-            auto_tick(flask_app)
-    threading.Thread(target=loop, daemon=True, name="autopost").start()
+
+def auto_status():
+    """What the Share page shows: is the clock alive, what ran last, what runs next."""
+    beat = to_int(setting("auto_beat", "0"), 0) or 0
+    age = int(time.time()) - beat if beat else None
+    now = datetime.now(LAGOS)
+
+    def nxt(kind):
+        hrs, mn = (photo_hours(), PHOTO_MINUTE) if kind == "photo" else (reel_hours(), REEL_MINUTE)
+        if not hrs or not (auto_photo_on() if kind == "photo" else auto_reel_on()):
+            return "off"
+        for d in (0, 1):
+            for h in hrs:
+                s = (now + timedelta(days=d)).replace(hour=h, minute=mn, second=0, microsecond=0)
+                if s > now:
+                    return f"{s:%a %H:%M}"
+        return "off"
+    return {"alive": age is not None and age < 90, "age": age, "last": setting("auto_last", ""), "err": setting("auto_err", ""),
+            "next_photo": nxt("photo"), "next_reel": nxt("reel")}
 
 
 @bp.post("/admin/share/auto")
 @admin_required
 def admin_share_auto():
-    on = "1" if request.form.get("auto_on") else "0"
-    times = [request.form.get(f"t{i}", "").strip() for i in (1, 2, 3)]
-    good = [t for t in times if re.fullmatch(r"\d{1,2}:\d{2}", t)]
-    set_setting("auto_times", ",".join(good) or AUTO_DEFAULT_TIMES)
+    was_on = auto_photo_on() or auto_reel_on()
+    set_setting("auto_photo_on", "1" if request.form.get("photo_on") else "0")
+    set_setting("auto_reel_on", "1" if request.form.get("reel_on") else "0")
+    set_setting("auto_off_hours", ",".join(str(h) for h in range(24) if not request.form.get(f"ph{h}")))
+    set_setting("auto_reel_off_hours", ",".join(str(h) for h in REEL_HOURS if not request.form.get(f"rl{h}")))
     set_setting("auto_fb", "1" if request.form.get("auto_fb") else "0")
     set_setting("auto_ig", "1" if request.form.get("auto_ig") else "0")
-    set_setting("auto_reel", "1" if request.form.get("auto_reel") else "0")
-    set_setting("auto_on", on)
-    if on == "1":                                  # do not fire slots that already passed today
-        now = datetime.now(LAGOS)
-        for t in auto_times():
-            h, m = map(int, t.split(":"))
-            if now.replace(hour=h, minute=m, second=0, microsecond=0) <= now:
-                set_setting(f"auto_done_{now:%Y-%m-%d}_{t}", "1")
-    flash("Auto-posting is ON. " + " · ".join(auto_times()) if on == "1" else "Auto-posting is OFF.")
+    if not was_on and (auto_photo_on() or auto_reel_on()):      # switching on: do not fire the slot that just passed
+        for kind, s in _due_slots(datetime.now(LAGOS)):
+            set_setting("auto_done_" + _slot_key(kind, s), "1")
+    flash("Saved. Photos: %s · Reels: %s." % (
+        f"{len(photo_hours())} hours a day" if auto_photo_on() else "off",
+        f"{len(reel_hours())} times a day" if auto_reel_on() else "off"))
     return redirect(url_for("web.admin_share"))
 
 
@@ -3582,7 +3844,7 @@ def admin_share_auto_run():
     if queue_job("next") is None:
         flash("A post is already being sent. Please wait a moment.")
     else:
-        flash("📤 Sending the next product in the background. You can leave the app.")
+        flash("📤 Sending a random product in the background. You can leave the app.")
     return redirect(url_for("web.admin_share"))
 
 
@@ -3613,26 +3875,32 @@ def admin_share():
 {% if busy %}<script>setTimeout(function(){location.reload()},4000);</script>{% endif %}{% endif %}
 <script>(function(){var s0="{{ sig }}";setInterval(function(){fetch("{{ url_for('web.admin_share_pulse') }}",{credentials:"same-origin"}).then(function(r){return r.json()}).then(function(d){if(d.sig!==s0)location.reload()}).catch(function(){})},10000)})();</script>
 {% if rdy.fb or rdy.ig %}<form method="post" action="{{ url_for('web.admin_share_auto') }}" class="card" style="padding:14px;margin-bottom:12px"><input type="hidden" name="csrf" value="{{ csrf }}">
-<div class="row between"><b>🤖 Auto-post</b><label class="small"><input type="checkbox" name="auto_on" value="1" {{ 'checked' if auto_on else '' }}> {{ 'ON' if auto_on else 'OFF' }}</label></div>
-<p class="mut small" style="margin:6px 0">At each time below, if you have not posted yourself, the app posts the product that has waited longest. Nigeria time.</p>
-<div class="row" style="gap:8px;flex-wrap:nowrap">{% for t in times %}<input type="time" name="t{{ loop.index }}" value="{{ t }}" style="min-width:0">{% endfor %}</div>
+<b>🤖 Automatic posting</b>
+<p class="small" style="margin:6px 0">{% if st.alive %}<span class="tag g">● Running</span>{% else %}<span class="tag bad">● Not running yet</span> <span class="mut">(it starts by itself; open this page again in a minute)</span>{% endif %}
+· Next photo: <b>{{ st.next_photo }}</b> · Next Reel: <b>{{ st.next_reel }}</b> <span class="mut">(Nigeria time)</span></p>
+{% if st.last %}<p class="small mut" style="margin:0 0 6px">Last: {{ st.last }}</p>{% endif %}{% if st.err %}<p class="small" style="color:#c0392b;margin:0 0 6px">Problem: {{ st.err }}</p>{% endif %}
+<label class="opt"><input type="checkbox" name="photo_on" value="1" {{ 'checked' if pon }}><span class="grow"><b>📷 Photo post every hour</b><div class="small mut">A random product, any age, once on the hour. Tick or untick any hour below.</div></span></label>
+<div style="display:grid;grid-template-columns:repeat(6,1fr);gap:6px;margin:8px 0">{% for h in range(24) %}<label class="small" style="text-align:center;border:1px solid var(--line,#ddd);border-radius:8px;padding:6px 0;display:block"><input type="checkbox" name="ph{{ h }}" value="1" {{ 'checked' if h in phours }} style="display:block;margin:0 auto 2px">{{ '%02d'|format(h) }}:00</label>{% endfor %}</div>
+<label class="opt"><input type="checkbox" name="reel_on" value="1" {{ 'checked' if ron }}><span class="grow"><b>🎬 Reel every 2 hours</b><div class="small mut">A random product made into a Reel with music, at half past the hour.</div></span></label>
+<div style="display:grid;grid-template-columns:repeat(6,1fr);gap:6px;margin:8px 0">{% for h in range(0,24,2) %}<label class="small" style="text-align:center;border:1px solid var(--line,#ddd);border-radius:8px;padding:6px 0;display:block"><input type="checkbox" name="rl{{ h }}" value="1" {{ 'checked' if h in rhours }} style="display:block;margin:0 auto 2px">{{ '%02d'|format(h) }}:30</label>{% endfor %}</div>
 <div class="small" style="margin:8px 0">{% if rdy.fb %}<label><input type="checkbox" name="auto_fb" value="1" {{ 'checked' if af else '' }}> Facebook</label> {% endif %}{% if rdy.ig %}<label style="margin-left:10px"><input type="checkbox" name="auto_ig" value="1" {{ 'checked' if ai else '' }}> Instagram</label>{% endif %}</div>
-<label class="small" style="display:block;margin-bottom:8px"><input type="checkbox" name="auto_reel" value="1" {{ 'checked' if ar else '' }}> 🎬 Make the last post of the day a Reel (video with music)</label>
+<p class="mut small" style="margin:0 0 8px">Sold-out products are never posted. Your own manual posts are separate and never change this schedule.</p>
 <div class="row"><button class="btn gold sm">Save</button>{% if nxt %}<a class="btn alt sm" href="{{ url_for('web.admin_share_reel', pid=nxt['id']) }}">🎬 Preview a Reel</a>{% endif %}</div></form>
-<form method="post" action="{{ url_for('web.admin_share_auto_run') }}" style="margin:-4px 0 12px"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn alt sm">▶ Post the next product now</button></form>{% endif %}
+<form method="post" action="{{ url_for('web.admin_share_auto_run') }}" style="margin:-4px 0 12px"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn alt sm">▶ Post a random product now</button></form>{% endif %}
 <p class="mut small">Tap a product. The picture and caption are made for you automatically. Just press Post.</p>
 {% for p in prods %}<div class="card" style="display:flex;gap:10px;align-items:center;padding:10px;margin-bottom:8px">
 <a href="{{ url_for('web.admin_share_product', pid=p['id']) }}" style="display:flex;gap:12px;align-items:center;text-decoration:none;color:inherit;flex:1;min-width:0">
 {% if p['photo_file_id'] %}<img src="{{ url_for('web.img', fid=p['photo_file_id']) }}" alt="" style="width:64px;height:64px;object-fit:cover;border-radius:10px;flex:none">{% endif %}
-<div class="grow" style="min-width:0"><b>{{ p['name'] }}</b><div class="small mut">{{ display_price(p) }}</div>
+<div class="grow" style="min-width:0"><b>{{ p['name'] }}</b>{% if p['sold_out'] %} <span class="tag bad">Sold out</span>{% endif %}<div class="small mut">{{ display_price(p) }}</div>
 {% if p['last_post'] %}<div class="small" style="color:#2a8a4a">✓ Posted {{ p['last_post'][:10] }}</div>{% endif %}</div><span class="btn alt sm">Share ›</span></a>
+<button type="button" class="btn wa sm" title="WhatsApp / Status with picture" data-card="{{ url_for('web.product_card', pid=p['id']) }}" data-text="{{ share_text(p) }}" onclick="shareCard(this)">🟢</button>
 <a class="btn gold sm" href="{{ url_for('web.admin_share_reel', pid=p['id']) }}" title="Post as a Reel">🎬</a></div>{% endfor %}
 {% if recent %}<h3 style="margin-top:18px">Recent posts</h3>{% for r in recent %}<div class="small" style="margin-bottom:4px">
 {{ '✅' if r['status']=='ok' else '❌' }} {{ r['platform']|title }}{% if r['auto'] %} 🤖{% endif %} · {{ r['name'] or r['product_id'] }} · {{ r['created_at'][:16] }}{% if r['error'] %}<div class="mut">{{ r['error'] }}</div>{% endif %}</div>{% endfor %}{% endif %}""",
-                      rdy=rdy, prods=prods, recent=recent, fb_name=setting("meta_page_name"), ig_name=setting("meta_ig_name"),
-                      auto_on=setting("auto_on", "0") == "1", af=setting("auto_fb", "1") == "1", ai=setting("auto_ig", "1") == "1",
-                      times=(auto_times() + ["", "", ""])[:3], ar=setting("auto_reel", "0") == "1", nxt=pick_auto_product(),
-                      jobs=_jobs, busy=any(j["status"] in ("queued", "working") for j in _jobs), sig=_job_sig())
+                      rdy=rdy, prods=prods, share_text=share_text, recent=recent, fb_name=setting("meta_page_name"), ig_name=setting("meta_ig_name"),
+                      af=setting("auto_fb", "1") == "1", ai=setting("auto_ig", "1") == "1",
+                      st=auto_status(), pon=auto_photo_on(), ron=auto_reel_on(), phours=photo_hours(), rhours=reel_hours(),
+                      nxt=pick_auto_product("reel"), jobs=_jobs, busy=any(j["status"] in ("queued", "working") for j in _jobs), sig=_job_sig())
 
 
 @bp.route("/admin/share/<pid>", methods=["GET", "POST"])
@@ -3665,6 +3933,9 @@ def admin_share_product(pid):
 <div class="card" style="padding:14px"><div class="row" style="gap:12px">{% if p['photo_file_id'] %}<img src="{{ url_for('web.img', fid=p['photo_file_id']) }}" alt="" style="width:96px;height:96px;object-fit:cover;border-radius:12px">{% endif %}
 <div class="grow"><h3 style="margin:0">{{ p['name'] }}</h3><div class="mut small">{{ display_price(p) }}</div>
 {% if last %}<div class="small" style="color:#b26a00">Already posted on {{ last[:10] }}</div>{% endif %}</div></div></div>
+<div class="card" style="padding:12px;margin-top:10px"><b>🟢 WhatsApp</b>
+<p class="mut small" style="margin:4px 0 8px">Sends the picture with the name and prices. In the list that opens choose a chat, a group, or <b>My status</b>.</p>
+<button type="button" class="btn wa sm" data-card="{{ url_for('web.product_card', pid=p['id']) }}" data-text="{{ wa_text }}" onclick="shareCard(this)">Share picture on WhatsApp / Status</button></div>
 <form method="post" class="card" style="padding:14px;margin-top:10px"><input type="hidden" name="csrf" value="{{ csrf }}">
 {% if photos %}<label class="l">Photos to post ({{ photos|length }}){% if photos|length > 1 %} · they go out as one swipe post{% endif %}</label>
 <div style="display:flex;gap:8px;overflow-x:auto;padding-bottom:8px;margin-bottom:8px">{% for f in photos %}<label style="flex:none;position:relative;display:block">
@@ -3679,7 +3950,7 @@ def admin_share_product(pid):
 <a class="btn alt" href="{{ url_for('web.admin_share_reel', pid=p['id']) }}">🎬 As a Reel</a></div>
 <p class="mut small">The caption was written for you. You can leave it as it is, or change anything before posting.</p></form>""",
                       p=p, rdy=rdy, last=last, shuffle=shuffle, photos=allphotos,
-                      cap_fb=fresh_caption(p, "fb", shuffle), cap_ig=fresh_caption(p, "ig", shuffle))
+                      cap_fb=fresh_caption(p, "fb", shuffle), cap_ig=fresh_caption(p, "ig", shuffle), wa_text=share_text(p))
 
 
 @bp.route("/admin/share/connect", methods=["GET", "POST"])
