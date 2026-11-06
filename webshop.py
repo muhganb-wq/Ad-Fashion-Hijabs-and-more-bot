@@ -62,13 +62,15 @@ def refresh_fabrics(force=False):
     try:
         c = sqlite3.connect(CFG["DB"])
         rows = c.execute("SELECT key,name,active FROM custom_fabrics ORDER BY position,rowid").fetchall()
+        over = dict(c.execute("SELECT key,name FROM fabric_names").fetchall())
         c.close()
     except Exception:
         return
-    FABRICS[:] = list(_BASE_FABRICS) + [(k, n) for k, n, a in rows if a]
+    base = [(k, over.get(k) or n) for k, n in _BASE_FABRICS]       # a renamed built-in fabric: same key, new name, prices untouched
+    FABRICS[:] = base + [(k, n) for k, n, a in rows if a]
     ALL_PRICE_KEYS[:] = FABRICS + UNITS
     FABRIC_NAME.clear()
-    FABRIC_NAME.update(dict(_BASE_FABRICS + UNITS))
+    FABRIC_NAME.update(dict(base + UNITS))
     FABRIC_NAME.update({k: n for k, n, a in rows})            # hidden fabrics keep their name for old orders
 
 
@@ -189,6 +191,7 @@ def init_web_db():
             picked TEXT DEFAULT '[]', caps TEXT DEFAULT '{}', take INTEGER DEFAULT 0, status TEXT DEFAULT 'queued',
             result TEXT DEFAULT '[]', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, finished_at TIMESTAMP);
         CREATE TABLE IF NOT EXISTS wa_sent(user_id INTEGER PRIMARY KEY, sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+        CREATE TABLE IF NOT EXISTS fabric_names(key TEXT PRIMARY KEY, name TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS custom_fabrics(key TEXT PRIMARY KEY, name TEXT NOT NULL, active INTEGER DEFAULT 1, position INTEGER DEFAULT 0);
         CREATE INDEX IF NOT EXISTS idx_notif_user ON notifications(user_id, is_read);
     """)
@@ -200,10 +203,12 @@ def init_web_db():
     addcol("orders", "web_user_id", "INTEGER")
     addcol("products", "sold_out", "INTEGER DEFAULT 0")
     addcol("product_photos", "sold_out", "INTEGER DEFAULT 0")
+    addcol("products", "restocked_at", "TEXT")
     addcol("orders", "received_confirmed", "INTEGER DEFAULT 0")
     addcol("social_posts", "caption", "TEXT DEFAULT ''")
     addcol("social_posts", "auto", "INTEGER DEFAULT 0")
     addcol("orders", "points_awarded", "INTEGER DEFAULT 0")
+    addcol("orders", "pickup_time", "TEXT DEFAULT ''")
     if c.execute("PRAGMA table_info(products)").fetchall() and "added_at" not in {r[1] for r in c.execute("PRAGMA table_info(products)")}:
         c.execute("ALTER TABLE products ADD COLUMN added_at TEXT")
         # first run only: the 8 most recently added products count as new arrivals so the section is not empty
@@ -910,6 +915,16 @@ def push_users(user_ids, title, body, url="/", tag=""):
         _push_to(user_ids=list(user_ids), title=title, body=body, url=url, tag=tag)
 
 
+def is_back(p, days=7):
+    """True when the product was put back in stock in the last few days (shows a BACK IN STOCK tag)."""
+    try:
+        if p["sold_out"] or not p["restocked_at"]:
+            return False
+        return datetime.strptime(str(p["restocked_at"])[:19], "%Y-%m-%d %H:%M:%S") >= datetime.utcnow() - timedelta(days=days)
+    except Exception:
+        return False
+
+
 def push_all_customers(title, body, url="/news"):
     try:
         c = sqlite3.connect(CFG["DB"])
@@ -1150,6 +1165,35 @@ def icon_maskable(size):
     return _icon_response(size, 0.68, "m")
 
 
+# ---- Embedded font (DejaVu Sans subset, free licence). Guarantees the naira sign and dots show on any server.
+_FONT_DATA = {
+    "B": "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",
+    "R": "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",
+}
+_font_paths = {}
+
+
+def _embedded_font_path(bold):
+    k = "B" if bold else "R"
+    p = _font_paths.get(k)
+    if p and os.path.exists(p):
+        return p
+    try:
+        import base64, zlib, tempfile
+        d = os.path.join(tempfile.gettempdir(), "adfashion_fonts")
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, f"ad_{k}.ttf")
+        if not os.path.exists(p) or os.path.getsize(p) < 1000:
+            tmp = p + f".{os.getpid()}.tmp"
+            with open(tmp, "wb") as f:
+                f.write(zlib.decompress(base64.b64decode(_FONT_DATA[k])))
+            os.replace(tmp, p)
+        _font_paths[k] = p
+        return p
+    except Exception:
+        return None
+
+
 # ================================================================== templates
 BASE = """<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -1303,7 +1347,7 @@ if(navigator.canShare&&navigator.canShare({files:[f]})){return navigator.share({
 var a=document.createElement('a');a.href=URL.createObjectURL(bl);a.download='product.jpg';document.body.appendChild(a);a.click();a.remove();setTimeout(fallback,400)}).catch(fallback)}
 </script></body></html>"""
 
-PCARD = """{% macro pcard(p) %}<a class="card pc" href="{{ url_for('web.product', pid=p['id']) }}">{% if p['sold_out'] %}<span class="nb" style="background:#b3261e;color:#fff">SOLD OUT</span>{% elif p['is_new'] %}<span class="nb">NEW</span>{% endif %}
+PCARD = """{% macro pcard(p) %}<a class="card pc" href="{{ url_for('web.product', pid=p['id']) }}">{% if p['sold_out'] %}<span class="nb" style="background:#b3261e;color:#fff">SOLD OUT</span>{% elif is_back(p) %}<span class="nb" style="background:#1f7a3d;color:#fff">BACK IN STOCK</span>{% elif p['is_new'] %}<span class="nb">NEW</span>{% endif %}
 {% if p['photo_file_id'] %}<img loading="lazy" src="{{ url_for('web.img', fid=p['photo_file_id']) }}" alt="{{ p['name'] }}">{% else %}<img alt="">{% endif %}
 <div class="b"><div class="t">{{ p['name'] }}</div><div class="price">{{ display_price(p) }}</div></div></a>{% endmacro %}"""
 
@@ -1318,7 +1362,7 @@ def unread_count():
 def page(title, body_tpl, tab="", **ctx):
     common = dict(csrf=csrf_token(), money=money, cfg=CFG, user=current_user(), status_label=STATUS_LABEL,
                   icon=svg_icon, display_price=display_price, app_name=APP_NAME, is_admin=is_admin_user(),
-                  fabric_name=FABRIC_NAME, fq=fmt_qty, unit_word=UNIT_WORD)
+                  fabric_name=FABRIC_NAME, fq=fmt_qty, unit_word=UNIT_WORD, is_back=is_back)
     body = render_template_string(PCARD + body_tpl, **common, **ctx)
     return render_template_string(BASE, title=title, body=body, tab=tab, cart_count=sum(cart().values()),
                                   unread=unread_count(), **{k: common[k] for k in ("user", "icon", "app_name", "is_admin", "csrf")})
@@ -1409,8 +1453,9 @@ def _logo_image():
 
 def _font(size, bold=True):
     from PIL import ImageFont
-    names = (["DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf", "Arial Bold.ttf"] if bold
-             else ["DejaVuSans.ttf", "LiberationSans-Regular.ttf", "Arial.ttf"])
+    names = ([_embedded_font_path(bold)] if _embedded_font_path(bold) else []) + (
+        ["DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf", "Arial Bold.ttf"] if bold
+        else ["DejaVuSans.ttf", "LiberationSans-Regular.ttf", "Arial.ttf"])
     for n in names:
         try:
             return ImageFont.truetype(n, size)
@@ -2029,6 +2074,8 @@ def checkout():
             ("web:" + u["email"], u["name"], phone, addr or CFG["ADDRESS"], "\n".join(lines), grand,
              "AWAITING_PAYMENT", method, city, state, notes, ",".join(i["key"] for i in items), u["id"]))
         oid = cur.lastrowid
+        if method == "pickup":
+            d.execute("UPDATE orders SET pickup_time=? WHERE id=?", (re.sub(r"\s+", " ", request.form.get("pickup_time", "")).strip()[:60], oid))
         for i in items:
             d.execute("""INSERT INTO order_items(order_id,product_id,product_name,quantity,unit_price,color_id,color_photo_file_id,fabric)
                          VALUES(?,?,?,?,?,?,?,?)""",
@@ -2053,6 +2100,7 @@ def checkout():
 <label class="l">Phone number</label><input name="phone" value="{{ user['phone'] }}" required inputmode="tel">
 <label class="l">Address (for delivery)</label><textarea name="address" rows="2"></textarea>
 <div class="row" style="flex-wrap:nowrap"><div class="grow"><label class="l">City</label><input name="city"></div><div class="grow"><label class="l">State</label><input name="state"></div></div>
+<label class="l">Picking up? When will you come? (optional, e.g. Saturday 4 PM)</label><input name="pickup_time" maxlength="60" placeholder="Only for pickup orders">
 <label class="l">Notes (optional)</label><input name="notes">
 <p class="mut small" style="margin:.2em 0 0">⭐ You will earn about {{ pts }} style points when this order is delivered.</p>
 <p><button class="btn gold block">Place order</button></p></form>""",
@@ -2531,6 +2579,42 @@ def admin_home():
 
 
 # ------------------------------------------------------------------ orders
+def remind_message(o):
+    """The WhatsApp reminder for an order, written for the order's current status (English)."""
+    first = (o["customer_name"] or "").split()[0] if (o["customer_name"] or "").strip() else "there"
+    ref = f"#AD-{o['id']:05d}"
+    st = o["status"]
+    first_line = (o["items"] or "").strip().splitlines()[0][:90] if (o["items"] or "").strip() else ""
+    what = f"{ref}" + (f" ({first_line})" if first_line else "") + f", total {money(o['total'])}"
+    try:
+        pick = (o["pickup_time"] or "").strip()
+    except (IndexError, KeyError):
+        pick = ""
+    if st in ("AWAITING_PAYMENT", "PENDING"):
+        body = (f"Hello {first}, this is AD FASHION SHOP. Your order {what} is still waiting for payment. "
+                "Please complete your payment so we can prepare it for you, and send us the receipt here once you have paid. Thank you!")
+    elif st in ("PAID", "PROCESSING") and o["delivery_method"] == "pickup":
+        when = f" You told us you would come {pick}." if pick else ""
+        body = (f"Hello {first}, this is AD FASHION SHOP. Your order {what} is paid and ready for pickup.{when} "
+                "We are still waiting for you. Please let us know when you are coming, or if you need a different time. Thank you!")
+    elif st in ("PAID", "PROCESSING"):
+        body = f"Hello {first}, this is AD FASHION SHOP. Your order {what} is paid and we are preparing it. We will update you very soon. Thank you!"
+    elif st == "OUT_FOR_DELIVERY":
+        body = f"Hello {first}, this is AD FASHION SHOP. Your order {what} is on its way. Please keep your phone close so our rider can reach you. Thank you!"
+    elif st == "DELIVERED":
+        body = f"Hello {first}, this is AD FASHION SHOP. Your order {what} was delivered. Please confirm that you received it, and thank you for shopping with us!"
+    else:
+        body = f"Hello {first}, this is AD FASHION SHOP, following up on your order {what}. Please reply here if you need anything. Thank you!"
+    return body
+
+
+def remind_link(o):
+    ph = norm_phone(o["phone"])
+    if not ph:
+        return ""
+    return "https://wa.me/" + ph.lstrip("+") + "?text=" + urllib.parse.quote(remind_message(o))
+
+
 @bp.get("/admin/orders")
 @admin_required
 def admin_orders():
@@ -2560,17 +2644,18 @@ def admin_order(oid):
 <div class="row between"><h2>Order #AD-{{ '%05d'|format(o['id']) }}</h2><span class="tag g">{{ status_label.get(o['status'], o['status']) }}</span></div>
 <div class="card" style="padding:14px"><p style="margin:0"><b>{{ o['customer_name'] }}</b>{% if o['web_user_id'] %} <span class="tag">App</span>{% else %} <span class="tag">Telegram {{ '@' ~ o['username'] if o['username'] }}</span>{% endif %}</p>
 <p class="small" style="margin:.3em 0">📞 {{ o['phone'] }}<br>🚚 {{ dm.get(o['delivery_method'], o['delivery_method']) }}<br>📍 {{ o['address'] }} {{ o['city'] }} {{ o['state'] }}
-{% if o['delivery_notes'] %}<br>📝 {{ o['delivery_notes'] }}{% endif %}<br>🕒 {{ o['created_at'] }}</p>
+{% if o['pickup_time'] %}<br>⏰ Pickup: {{ o['pickup_time'] }}{% endif %}{% if o['delivery_notes'] %}<br>📝 {{ o['delivery_notes'] }}{% endif %}<br>🕒 {{ o['created_at'] }}</p>
 <pre style="white-space:pre-wrap;font:inherit;margin:.6em 0">{{ o['items'] }}</pre>
 <div class="row between"><b>Total</b><b class="price">{{ money(o['total']) }}</b></div>
 {% if o['received_confirmed'] %}<p style="color:var(--ok);font-weight:700;margin-bottom:0">✅ Customer confirmed: RECEIVED AND THANK YOU</p>{% endif %}</div>
 {% if o['receipt_file_id'] %}<h3 style="margin-top:14px">Payment receipt</h3><img src="{{ url_for('web.img', fid=o['receipt_file_id']) }}" style="max-width:100%;border-radius:14px" alt="">{% elif o['payment_notified'] %}<p class="mut">Customer says they paid (check Telegram for the receipt).</p>{% endif %}
+{% if rlink and o['status'] not in ('CANCELLED',) %}<a class="btn alt block" style="margin-top:12px" href="{{ rlink }}" target="_blank" rel="noopener">💬 Remind on WhatsApp</a><p class="mut small" style="margin:4px 0 0">Opens {{ o['customer_name'] }}'s WhatsApp with a message ready for this order's status. You press send.</p>{% endif %}
 {% if o['status'] in ('AWAITING_PAYMENT','PENDING') %}<div class="row" style="margin-top:12px">
 <form method="post" action="{{ url_for('web.admin_order_status', oid=o['id']) }}" class="grow"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="status" value="PAID"><button class="btn gold block">✅ Verify payment</button></form></div>{% endif %}
 <h3 style="margin-top:16px">Change status</h3>
 <form method="post" action="{{ url_for('web.admin_order_status', oid=o['id']) }}" class="row" style="flex-wrap:nowrap"><input type="hidden" name="csrf" value="{{ csrf }}">
 <select name="status" class="grow">{% for k,v in labels.items() %}<option value="{{ k }}" {{ 'selected' if k==o['status'] }}>{{ v }}</option>{% endfor %}</select><button class="btn">Update</button></form>
-<p class="mut small">The customer is notified on Telegram (or sees it in the app).</p>""", o=o, dm=DELIVERY, labels=STATUS_LABEL)
+<p class="mut small">The customer is notified on Telegram (or sees it in the app).</p>""", o=o, dm=DELIVERY, labels=STATUS_LABEL, rlink=remind_link(o))
 
 
 @bp.post("/admin/order/<int:oid>/status")
@@ -2714,9 +2799,11 @@ def admin_product(pid):
 <label class="opt" style="margin-top:12px"><input type="checkbox" name="active" value="1" {{ 'checked' if is_new or p['active'] }}><span>Visible in the shop</span></label>
 <p><button class="btn gold block">Save product</button></p></form>
 <form method="post" action="{{ url_for('web.admin_fabric_add') }}" class="card" style="padding:14px;margin-top:12px"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="pid" value="{{ 'new' if is_new else p['id'] }}">
-<b>🧵 Add a new fabric</b><p class="mut small" style="margin:4px 0 8px">For Hijabs &amp; Jilbabs. Dan Kaduna, Zoom and Egyptian stay exactly as they are. The new fabric shows on every product with an empty price until you set it.</p>
+<b>🧵 Add a new fabric</b><p class="mut small" style="margin:4px 0 8px">For Hijabs &amp; Jilbabs. The new fabric shows on every product with an empty price until you set it.</p>
 <div class="row" style="flex-wrap:nowrap"><input name="fname" placeholder="e.g. Crepe" maxlength="30" required><button class="btn alt sm">Add</button></div>
 {% if mine %}<div class="small mut" style="margin-top:8px">Fabrics you added: {% for k,n in mine %}<span class="tag">{{ n }}</span> <button class="btn alt sm" style="padding:2px 8px" formaction="{{ url_for('web.admin_fabric_hide', key=k) }}" formnovalidate onclick="return confirm('Stop offering {{ n }}? Old orders keep it.')">hide</button> {% endfor %}</div>{% endif %}</form>
+<div class="card" style="padding:14px;margin-top:12px"><b>✏️ Rename a fabric</b><p class="mut small" style="margin:4px 0 8px">The new name shows on every product that uses this fabric (hijabs, jilbabs and all others). Prices are never changed. Old orders keep the name they were placed with.</p>
+{% for k,n in fabrics %}<form method="post" action="{{ url_for('web.admin_fabric_rename', key=k) }}" class="row" style="flex-wrap:nowrap;margin-bottom:6px"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="pid" value="{{ 'new' if is_new else p['id'] }}"><input name="fname" value="{{ n }}" maxlength="34" class="grow" required><button class="btn alt sm">Save</button></form>{% endfor %}</div>
 {% if not is_new %}<form method="post" action="{{ url_for('web.admin_product_soldout', pid=p['id']) }}" style="margin-top:14px"><input type="hidden" name="csrf" value="{{ csrf }}">
 {% if p['sold_out'] %}<p class="tag bad" style="display:block;padding:8px">This product is marked SOLD OUT. Customers cannot order it and it is not auto-posted.</p><button class="btn gold block">✅ Back in stock (restock)</button>
 {% else %}<button class="btn alt block" onclick="return confirm('Mark this product as sold out?')">🚫 Mark as sold out</button>{% endif %}</form>
@@ -2792,6 +2879,31 @@ def admin_fabric_add():
     return redirect(url_for("web.admin_product", pid=pid))
 
 
+@bp.post("/admin/fabric/<key>/rename")
+@admin_required
+def admin_fabric_rename(key):
+    refresh_fabrics(True)
+    if key not in FABRIC_NAME or is_unit_key(key):
+        abort(404)
+    name = re.sub(r"\s+", " ", request.form.get("fname", "").strip())[:34]
+    pid = request.form.get("pid", "new")
+    if len(name) < 2:
+        flash("Please type the fabric name.")
+    else:
+        label = name if name.lower().endswith("fabric") else name + " Fabric"
+        if any(n.lower() == label.lower() and k != key for k, n in FABRIC_NAME.items() if not is_unit_key(k)):
+            flash("Another fabric already has that name.")
+        else:
+            if key in dict(_BASE_FABRICS):
+                db().execute("INSERT INTO fabric_names(key,name) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET name=excluded.name", (key, label))
+            else:
+                db().execute("UPDATE custom_fabrics SET name=? WHERE key=?", (label, key))
+            db().commit()
+            refresh_fabrics(True)
+            flash(f"Renamed to {label}. It now shows on every product that uses it. Prices did not change.")
+    return redirect(url_for("web.admin_product", pid=pid))
+
+
 @bp.post("/admin/fabric/<key>/hide")
 @admin_required
 def admin_fabric_hide(key):
@@ -2809,23 +2921,30 @@ def admin_product_soldout(pid):
     if not p:
         abort(404)
     now_sold = 0 if p["sold_out"] else 1
-    db().execute("UPDATE products SET sold_out=? WHERE id=?", (now_sold, pid)); db().commit()
     if now_sold:
-        flash("Marked as sold out.")
+        db().execute("UPDATE products SET sold_out=1, restocked_at=NULL WHERE id=?", (pid,))
     else:
-        flash("Back in stock. Customers who saved it were told.")
-        try:
-            notify_restock(p)
-        except Exception:
-            pass
+        db().execute("UPDATE products SET sold_out=0, restocked_at=datetime('now') WHERE id=?", (pid,))
+    db().commit()
+    try:
+        (notify_soldout if now_sold else notify_restock)(p)
+    except Exception:
+        pass
+    flash("Marked as sold out. Customers who saved it were told." if now_sold
+          else "Back in stock. All customers were told and the product shows a BACK IN STOCK tag for 7 days.")
     return redirect(url_for("web.admin_product", pid=pid))
 
 
+def notify_soldout(p):
+    """Tell the customers who saved this product that it is sold out."""
+    ids = [r["user_id"] for r in db().execute("SELECT user_id FROM web_wishlist WHERE product_id=?", (p["id"],)).fetchall()]
+    push_users(ids, "Sold out", f"{p['name']} is sold out for now. We will tell you when it is back.", url_for("web.product", pid=p["id"]), tag="stock-" + str(p["id"]))
+
+
 def notify_restock(p):
-    """Tell everyone who saved this product that it is available again."""
-    rows = db().execute("SELECT user_id FROM web_wishlist WHERE product_id=?", (p["id"],)).fetchall()
-    for r in rows:
-        push_users([r["user_id"]], "Back in stock 🎉", f"{p['name']} is available again.", url_for("web.product", pid=p["id"]))
+    """Tell every customer that this product is available again."""
+    ids = [r["id"] for r in db().execute("SELECT id FROM web_users").fetchall()]
+    push_users(ids, "Back in stock 🎉", f"{p['name']} is available again.", url_for("web.product", pid=p["id"]), tag="stock-" + str(p["id"]))
 
 
 @bp.post("/admin/product/<pid>/delete")
@@ -3193,9 +3312,74 @@ def site_base():
     return (setting("site_seen") or "").rstrip("/")
 
 
-def pub_img_url(fid, fit=False):
+def pub_img_url(fid, fit=False, cover=False):
     base = site_base()
-    return f"{base}/pubimg/{_pub_sig(fid)}/{fid}.jpg" + ("?fit=45" if fit else "")
+    return f"{base}/pubimg/{_pub_sig(fid)}/{fid}.jpg" + ("?fit=916" if cover else ("?fit=45" if fit else ""))
+
+
+def reel_cover_image(im):
+    """9:16 cover for a Reel: the whole product picture over a soft blurred copy of itself, so the Instagram grid
+    shows the product (not a black first frame)."""
+    from PIL import Image, ImageFilter, ImageEnhance
+    W, H = 1080, 1920
+    im = im.convert("RGB")
+    sc = max(W / im.width, H / im.height)
+    bg = im.resize((max(W, int(im.width * sc + .5)), max(H, int(im.height * sc + .5))))
+    l, t = (bg.width - W) // 2, (bg.height - H) // 2
+    bg = bg.crop((l, t, l + W, t + H)).filter(ImageFilter.GaussianBlur(38))
+    bg = ImageEnhance.Brightness(bg).enhance(0.55)
+    fg_sc = min(W / im.width, 1500 / im.height)
+    fg = im.resize((max(1, int(im.width * fg_sc)), max(1, int(im.height * fg_sc))))
+    bg.paste(fg, ((W - fg.width) // 2, (H - fg.height) // 2))
+    return bg
+
+
+_BRAND_LOGO = {}
+
+
+def _brand_logo_small():
+    """The shop logo as a small round emblem, cached until the logo is changed."""
+    key = setting("web_logo") or "default"
+    if _BRAND_LOGO.get("key") != key:
+        from PIL import Image, ImageDraw
+        em = None
+        try:
+            lg = _logo_image()
+            if lg is not None:
+                side = min(lg.size)
+                w, h = lg.size
+                em = lg.convert("RGB").crop(((w - side) // 2, (h - side) // 2, (w + side) // 2, (h + side) // 2)).resize((104, 104), Image.LANCZOS)
+                m = Image.new("L", (416, 416), 0)
+                ImageDraw.Draw(m).ellipse([0, 0, 415, 415], fill=255)
+                em.putalpha(m.resize((104, 104), Image.LANCZOS))
+        except Exception:
+            em = None
+        _BRAND_LOGO.update(key=key, img=em)
+    return _BRAND_LOGO.get("img")
+
+
+def brand_frame(im, emblem):
+    """Every photo that is shared sits in a 4:5 frame with a slim brand strip at the bottom that holds the logo,
+    so the logo never covers the product and nothing is cropped."""
+    from PIL import Image, ImageDraw
+    W, H, S = 1080, 1350, 130
+    im = im.convert("RGB")
+    area = H - S
+    sc = min(W / im.width, area / im.height)
+    pic = im.resize((max(1, int(im.width * sc)), max(1, int(im.height * sc))), Image.LANCZOS)
+    canvas = Image.new("RGB", (W, H), "white")
+    canvas.paste(pic, ((W - pic.width) // 2, (area - pic.height) // 2))
+    d = ImageDraw.Draw(canvas)
+    gold = (214, 168, 64)
+    d.rectangle([0, area, W, H], fill=(14, 14, 14))
+    d.rectangle([0, area, W, area + 4], fill=gold)
+    x = 36
+    if emblem is not None:
+        canvas.paste(emblem.convert("RGB"), (x, area + 4 + (S - 4 - 104) // 2), emblem.split()[-1])
+        x += 104 + 26
+    d.text((x, area + 22), "AD FASHION SHOP", font=_font(44), fill=gold)
+    d.text((x, area + 80), "Modesty  •  Elegance  •  Quality", font=_font(26, bold=False), fill=(205, 205, 205))
+    return canvas
 
 
 @bp.get("/pubimg/<sig>/<path:fid>.jpg")
@@ -3212,23 +3396,10 @@ def pubimg(sig, fid):
         from PIL import Image
         im = Image.open(path).convert("RGB")
         w, h = im.size
-        if request.args.get("fit") == "45":      # swipe posts: fit every photo inside the same 4:5 frame, nothing cropped
-            cw, ch = 1080, 1350
-            sc = min(cw / w, ch / h)
-            im = im.resize((max(1, int(w * sc)), max(1, int(h * sc))))
-            canvas = Image.new("RGB", (cw, ch), "white")
-            canvas.paste(im, ((cw - im.size[0]) // 2, (ch - im.size[1]) // 2))
-            buf = io.BytesIO(); canvas.save(buf, "JPEG", quality=90)
+        if request.args.get("fit") == "916":     # Reel cover picture
+            buf = io.BytesIO(); reel_cover_image(im).save(buf, "JPEG", quality=88)
             return Response(buf.getvalue(), mimetype="image/jpeg", headers={"Cache-Control": "public, max-age=3600"})
-        ratio = w / h
-        lo, hi = 0.8, 1.91                      # Instagram accepts 4:5 up to 1.91:1; pad with white otherwise
-        if ratio < lo:
-            nw = int(h * lo); canvas = Image.new("RGB", (nw, h), "white"); canvas.paste(im, ((nw - w) // 2, 0)); im = canvas
-        elif ratio > hi:
-            nh = int(w / hi); canvas = Image.new("RGB", (w, nh), "white"); canvas.paste(im, (0, (nh - h) // 2)); im = canvas
-        if im.size[0] > 1440:
-            im = im.resize((1440, int(im.size[1] * 1440 / im.size[0])))
-        buf = io.BytesIO(); im.save(buf, "JPEG", quality=90)
+        buf = io.BytesIO(); brand_frame(im, _brand_logo_small()).save(buf, "JPEG", quality=90)
         return Response(buf.getvalue(), mimetype="image/jpeg", headers={"Cache-Control": "public, max-age=3600"})
     except Exception:
         return send_file(path, mimetype="image/jpeg", max_age=3600)
@@ -5090,16 +5261,36 @@ def admin_reelfile(name):
 
 
 # ---------------------------------------------------------------- posting a Reel
-def post_instagram_reel(video_url, caption):
+def post_instagram_reel(video_url, caption, cover_url=None):
     base, tok = _ig_target()
     ig = setting("meta_ig_id")
-    cid = _graph("POST", f"/{ig}/media", {"media_type": "REELS", "video_url": video_url, "caption": caption,
-                                           "share_to_feed": "true", "access_token": tok}, base=base)["id"]
+    params = {"media_type": "REELS", "video_url": video_url, "caption": caption, "share_to_feed": "true", "access_token": tok}
+    try:
+        cid = _graph("POST", f"/{ig}/media", dict(params, cover_url=cover_url) if cover_url else params, base=base)["id"]
+    except Exception as e:
+        if not cover_url or "cover" not in str(e).lower():
+            raise
+        cid = _graph("POST", f"/{ig}/media", params, base=base)["id"]      # the cover was refused: post the Reel without it
     _ig_wait(cid, tok, base, tries=70, pause=3)                 # Instagram needs a little while to process a video
     return _ig_publish(ig, cid, tok, base)
 
 
-def post_facebook_reel(video_url, caption, info=None):
+def _fb_set_cover(video_id, tok, cover_bytes):
+    """Best effort: give the Facebook Reel a product picture as its thumbnail. Never stops the post."""
+    try:
+        b = "----adcover" + secrets.token_hex(8)
+        body = (f"--{b}\r\nContent-Disposition: form-data; name=\"is_preferred\"\r\n\r\ntrue\r\n"
+                f"--{b}\r\nContent-Disposition: form-data; name=\"access_token\"\r\n\r\n{tok}\r\n"
+                f"--{b}\r\nContent-Disposition: form-data; name=\"source\"; filename=\"cover.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n").encode() \
+               + cover_bytes + f"\r\n--{b}--\r\n".encode()
+        req = urllib.request.Request(f"https://graph.facebook.com/v21.0/{video_id}/thumbnails", data=body, method="POST",
+                                     headers={"Content-Type": f"multipart/form-data; boundary={b}"})
+        urllib.request.urlopen(req, timeout=60).read()
+    except Exception:
+        pass
+
+
+def post_facebook_reel(video_url, caption, info=None, cover_bytes=None):
     page, tok = setting("meta_fb_page_id"), setting("meta_page_token")
     try:
         s = _graph("POST", f"/{page}/video_reels", {"upload_phase": "start", "access_token": tok})
@@ -5108,6 +5299,8 @@ def post_facebook_reel(video_url, caption, info=None):
         urllib.request.urlopen(req, timeout=120).read()
         _graph("POST", f"/{page}/video_reels", {"upload_phase": "finish", "video_id": s["video_id"],
                                                  "video_state": "PUBLISHED", "description": caption, "access_token": tok})
+        if cover_bytes:
+            _fb_set_cover(s["video_id"], tok, cover_bytes)
         return s["video_id"]
     except Exception:
         # Fall back to an ordinary Facebook video if the Reel route is refused (Facebook then fetches the file later).
@@ -5116,9 +5309,29 @@ def post_facebook_reel(video_url, caption, info=None):
         return _graph("POST", f"/{page}/videos", {"file_url": video_url, "description": caption, "access_token": tok}).get("id", "")
 
 
+def _reel_cover(pid):
+    """(public cover URL for Instagram, cover picture bytes for Facebook) from the product's first in-stock photo."""
+    try:
+        items = reel_items(pid)
+        if not items:
+            return None, None
+        fid = items[0]["file_id"]
+        with _share_tmp():
+            path = fetch_file(fid)
+        if not path:
+            return None, None
+        from PIL import Image
+        buf = io.BytesIO()
+        reel_cover_image(Image.open(path)).save(buf, "JPEG", quality=88)
+        return pub_img_url(fid, cover=True), buf.getvalue()
+    except Exception:
+        return None, None
+
+
 def do_reel(p, path, want, caps=None, auto=0):
     rdy, caps, out, pid, info = social_ready(), caps or {}, [], p["id"], {}
     url = pub_vid_url(path)
+    info["cover_url"], info["cover_bytes"] = _reel_cover(pid)
     try:
         return _do_reel(p, url, want, rdy, caps, out, pid, info, auto)
     finally:                                      # the video is not kept on the server once it has been sent
@@ -5134,7 +5347,10 @@ def _do_reel(p, url, want, rdy, caps, out, pid, info, auto=0):
         if not caption or _norm(caption) in used_captions(pid, label):
             caption = fresh_reel_caption(p, plat)
         try:
-            rid = fn(url, caption[:2100], info) if plat == "fb" else fn(url, caption[:2100])
+            if plat == "fb":
+                rid = fn(url, caption[:2100], info, info.get("cover_bytes"))
+            else:
+                rid = fn(url, caption[:2100], info.get("cover_url"))
             db().execute("INSERT INTO social_posts(product_id,platform,status,remote_id,caption,auto) VALUES(?,?,?,?,?,?)",
                          (pid, label, "ok", str(rid), caption[:2100], auto))
             out.append(f"✅ Posted Reel to {label}")
