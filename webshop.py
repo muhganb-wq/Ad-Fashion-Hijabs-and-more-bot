@@ -1342,15 +1342,21 @@ if(ok){
 var dp=null;window.addEventListener('beforeinstallprompt',function(e){e.preventDefault();dp=e;var b=document.getElementById('inst');var x=false;try{x=sessionStorage.getItem('instx')}catch(_){}if(!x)b.style.display='flex';});
 document.getElementById('instbtn').onclick=function(){if(dp){dp.prompt();dp=null;}document.getElementById('inst').style.display='none';};
 document.getElementById('instx').onclick=function(){document.getElementById('inst').style.display='none';try{sessionStorage.setItem('instx','1')}catch(e){}};
-function shareCard(b){var card=b.getAttribute('data-card'),more=(b.getAttribute('data-more')||'').split(',').filter(Boolean),text=b.getAttribute('data-text')||'';b.disabled=true;var old=b.innerHTML;b.innerHTML='Preparing…';
-function done(){b.disabled=false;b.innerHTML=old}
-function fallback(){window.open('https://wa.me/?text='+encodeURIComponent(text),'_blank');done()}
-var urls=[card].concat(more);
-Promise.all(urls.map(function(u,i){return fetch(u,{credentials:'same-origin'}).then(function(r){if(!r.ok)throw 0;return r.blob()}).then(function(bl){return new File([bl],'product'+(i+1)+'.jpg',{type:'image/jpeg'})}).catch(function(){return i==0?Promise.reject():null})})).then(function(fs){
-fs=fs.filter(Boolean);if(!fs.length)throw 0;
-if(navigator.canShare&&navigator.canShare({files:fs})){return navigator.share({files:fs,text:text}).then(done,function(e){if(e&&e.name==='AbortError')done();else fallback()})}
-if(navigator.canShare&&navigator.canShare({files:[fs[0]]})){return navigator.share({files:[fs[0]],text:text}).then(done,function(e){if(e&&e.name==='AbortError')done();else fallback()})}
-fs.forEach(function(f,i){setTimeout(function(){var a=document.createElement('a');a.href=URL.createObjectURL(f);a.download=f.name;document.body.appendChild(a);a.click();a.remove()},i*350)});setTimeout(fallback,400+fs.length*350)}).catch(fallback)}
+function prep(b){if(b._files)return Promise.resolve(b._files);if(b._p)return b._p;
+var urls=[b.getAttribute('data-card')].concat((b.getAttribute('data-more')||'').split(',').filter(Boolean));
+b._p=Promise.all(urls.map(function(u,i){return fetch(u,{credentials:'same-origin'}).then(function(r){if(!r.ok)throw 0;return r.blob()}).then(function(bl){return new File([bl],'product'+(i+1)+'.jpg',{type:'image/jpeg'})}).catch(function(){return i==0?Promise.reject():null})})).then(function(fs){fs=fs.filter(Boolean);if(!fs.length)throw 0;b._files=fs;return fs}).catch(function(e){b._p=null;throw e});return b._p}
+function shareCard(b){var text=b.getAttribute('data-text')||'';if(!b._old)b._old=b.innerHTML;
+function reset(){b.disabled=false;b.innerHTML=b._old}
+function fallback(){reset();window.location.href='https://wa.me/?text='+encodeURIComponent(text)}
+function save(fs){fs.forEach(function(f,i){setTimeout(function(){var a=document.createElement('a');a.href=URL.createObjectURL(f);a.download=f.name;document.body.appendChild(a);a.click();a.remove()},i*350)});setTimeout(fallback,400+fs.length*350)}
+function go(fs){var d=null;try{if(navigator.canShare&&navigator.canShare({files:fs}))d=fs;else if(navigator.canShare&&navigator.canShare({files:[fs[0]]}))d=[fs[0]]}catch(e){}
+if(!d)return save(fs);
+var p;try{p=navigator.share({files:d,text:text})}catch(e){p=Promise.reject(e)}
+p.then(reset,function(e){if(e&&e.name==='AbortError')reset();else if(e&&e.name==='NotAllowedError'){b.disabled=false;b.innerHTML='\u2705 Ready: tap to share'}else fallback()})}
+if(b._files)return go(b._files);
+b.disabled=true;b.innerHTML='Preparing\u2026';
+prep(b).then(go).catch(fallback)}
+setTimeout(function(){document.querySelectorAll('[data-pre="1"]').forEach(function(b){prep(b).catch(function(){})})},1500);
 </script></body></html>"""
 
 PCARD = """{% macro pcard(p) %}<a class="card pc" href="{{ url_for('web.product', pid=p['id']) }}">{% if p['sold_out'] %}<span class="nb" style="background:#b3261e;color:#fff">SOLD OUT</span>{% elif is_back(p) %}<span class="nb" style="background:#1f7a3d;color:#fff">BACK IN STOCK</span>{% elif p['is_new'] %}<span class="nb">NEW</span>{% endif %}
@@ -1827,6 +1833,20 @@ def share_text(p):
     return "\n".join(lines)
 
 
+_GEN_CACHE = {}
+
+
+def _gen_cached(key, build):
+    """Keep the last few share pictures in memory only (never on disk), so a second tap is instant."""
+    v = _GEN_CACHE.get(key)
+    if v is None:
+        v = build()
+        while len(_GEN_CACHE) >= 24:
+            _GEN_CACHE.pop(next(iter(_GEN_CACHE)))
+        _GEN_CACHE[key] = v
+    return v
+
+
 SHARE_MAX_PHOTOS = 6                                   # the card + up to 5 more pictures per share
 
 
@@ -1849,14 +1869,20 @@ def product_share_photo(pid, i):
     ph = [x for x in ph if not x["sold_out"]] or ph
     if i < 0 or i >= len(ph):
         abort(404)
-    path = fetch_file(ph[i]["file_id"])
-    if not path:
+    def build():
+        path = fetch_file(ph[i]["file_id"])
+        if not path:
+            return None
+        from PIL import Image
+        emblem = _brand_logo_small()
+        buf = io.BytesIO()
+        brand_frame(Image.open(path).convert("RGB"), emblem).save(buf, "JPEG", quality=88)
+        return buf.getvalue()
+    data = _gen_cached(("sp", pid, ph[i]["file_id"], setting("web_logo")), build)
+    if not data:
+        _GEN_CACHE.pop(("sp", pid, ph[i]["file_id"], setting("web_logo")), None)
         abort(404)
-    from PIL import Image
-    emblem = _brand_logo_small()
-    buf = io.BytesIO()
-    brand_frame(Image.open(path).convert("RGB"), emblem).save(buf, "JPEG", quality=88)
-    return Response(buf.getvalue(), mimetype="image/jpeg", headers={"Cache-Control": "no-cache"})
+    return Response(data, mimetype="image/jpeg", headers={"Cache-Control": "no-cache"})
 
 
 @bp.get("/p/<pid>/card.jpg")
@@ -1868,6 +1894,10 @@ def product_card(pid):
     from PIL import Image, ImageDraw
     ph = product_photos(pid)
     ph = [x for x in ph if not x["sold_out"]] or ph
+    ckey = ("card", pid, p["name"], p["price"], p["sold_out"], tuple(fabric_prices(pid).items()), tuple(x["file_id"] for x in ph), setting("web_logo"))
+    hit = _GEN_CACHE.get(ckey)
+    if hit:
+        return Response(hit, mimetype="image/jpeg", headers={"Cache-Control": "no-cache"})
     path = fetch_file(ph[0]["file_id"]) if ph else None
     W = 1080
     try:
@@ -1914,6 +1944,8 @@ def product_card(pid):
         d.text((W - 305, 40), "SOLD OUT", font=_font(40), fill=(255, 255, 255))
     buf = io.BytesIO()
     im.save(buf, "JPEG", quality=88)
+    if path:
+        _gen_cached(ckey, lambda: buf.getvalue())
     return Response(buf.getvalue(), mimetype="image/jpeg", headers={"Cache-Control": "no-cache"})
 
 
@@ -1954,7 +1986,7 @@ def product(pid):
 {% if by_unit %}<p class="mut small" style="margin:.4em 0 0">You can use decimals, for example 2.5.</p>{% endif %}
 {% if p['sold_out'] %}<p class="tag bad" style="display:block;margin-top:14px;padding:10px;text-align:center"><b>Sold out for now</b> — save it and we will tell you when it is back in stock.</p>{% endif %}
 <div class="row" style="margin-top:18px">{% if p['sold_out'] %}<button class="btn grow" type="button" disabled style="opacity:.5">Sold out</button>{% else %}<button class="btn gold grow">{{ icon('cart') }} Add to cart</button>{% endif %}
-<button type="button" class="btn wa" data-card="{{ url_for('web.product_card', pid=p['id']) }}" data-more="{{ share_more(p['id']) }}" data-text="{{ share_msg }}" onclick="shareCard(this)">Share</button></div></form>
+<button type="button" class="btn wa" data-card="{{ url_for('web.product_card', pid=p['id']) }}" data-more="{{ share_more(p['id']) }}" data-pre="{{ 1 if is_admin else 0 }}" data-text="{{ share_msg }}" onclick="shareCard(this)">Share</button></div></form>
 <form method="post" action="{{ url_for('web.wish', pid=p['id']) }}" style="margin-top:10px"><input type="hidden" name="csrf" value="{{ csrf }}">
 <button class="btn alt sm">{{ icon('heart') }} {{ 'Saved to wishlist' if wished else 'Save for later' }}</button></form>
 </div></div>
