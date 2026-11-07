@@ -4022,9 +4022,8 @@ def run_job(flask_app, jid):
             p = db().execute("SELECT * FROM products WHERE id=?", (j["product_id"],)).fetchone() if j["product_id"] else None
             pushed = False
             if j["kind"] == "general":
-                part = to_int((j["product_id"] or "general1")[7:], 1) or 1
-                p = {"id": j["product_id"], "name": f"Shop Reel Part {part}"}
-                msgs = do_general_reel(part, want, take=j["take"] or 0, caps=caps)
+                p = {"id": "general", "name": "Shop Reel"}
+                msgs = do_general_reel(want, caps=caps)
             elif j["kind"] == "next":
                 p, msgs = run_auto_post("manual")
                 pushed = True                                    # run_auto_post already tells the admin
@@ -4078,7 +4077,7 @@ def recent_jobs(limit=5):
             msgs = json.loads(r["result"] or "[]")
         except ValueError:
             msgs = []
-        out.append({"id": r["id"], "name": r["name"] or (("Shop Reel Part " + (r["product_id"] or "")[7:]) if (r["product_id"] or "").startswith("general") else "Next product"), "kind": r["kind"], "status": r["status"],
+        out.append({"id": r["id"], "name": r["name"] or ("Shop Reel" if (r["product_id"] or "").startswith("general") else "Next product"), "kind": r["kind"], "status": r["status"],
                     "msgs": msgs, "at": (r["finished_at"] or r["created_at"] or "")[11:16]})
     return out
 
@@ -4223,7 +4222,7 @@ def _run_slot(flask_app, kind, skey):
             except ValueError:
                 part = {}
             if kind.startswith("gen"):
-                p, msgs = run_general_auto(to_int(kind[3:], 1) or 1, only=part.get("only"))
+                p, msgs = run_general_auto(only=part.get("only"))
             else:
                 p, msgs = run_auto_post(skey, reel=(kind == "reel"), only=part.get("only"), pid=part.get("pid"))
             good = [m for m in msgs if m.startswith("✅")]
@@ -4377,7 +4376,7 @@ def auto_status():
                 if s > now:
                     best.append((s, part)); break
         best.sort()
-        return " · ".join(f"Part {pt} {s:%a %H:%M}" for s, pt in best) or "off"
+        return " · ".join(f"{s:%a %H:%M}" for s, pt in best) or "off"
     return {"next_gen": nxt_gen(), "alive": age is not None and age < 90, "age": age, "last": setting("auto_last", ""), "err": setting("auto_err", ""),
             "next_photo": nxt("photo"), "next_reel": nxt("reel")}
 
@@ -4437,14 +4436,14 @@ def admin_share():
 {% for m in j['msgs'] %}<div class="mut">{{ m }}</div>{% endfor %}</div>{% endfor %}</div>
 {% if busy %}<script>setTimeout(function(){location.reload()},4000);</script>{% endif %}{% endif %}
 <script>(function(){var s0="{{ sig }}";setInterval(function(){fetch("{{ url_for('web.admin_share_pulse') }}",{credentials:"same-origin"}).then(function(r){return r.json()}).then(function(d){if(d.sig!==s0)location.reload()}).catch(function(){})},10000)})();</script>
-<div class="card" style="padding:14px;margin-bottom:12px"><b>🎬 Shop Reel: many products in 2 parts</b>
-<p class="small mut" style="margin:6px 0">One Reel for the whole shop with intense music. Part 1 and Part 2 show different products. Made when you post, removed after sending.</p>
-<div class="row"><a class="btn gold sm" href="{{ url_for('web.admin_share_general', part=1) }}">🎬 Part 1</a><a class="btn gold sm" href="{{ url_for('web.admin_share_general', part=2) }}">🎬 Part 2</a></div>
+<div class="card" style="padding:14px;margin-bottom:12px"><b>🎬 Shop Reel: many products in one video</b>
+<p class="small mut" style="margin:6px 0">One Reel for the whole shop with intense music. Every time it shows products that were not in the last one. Made when you post, removed after sending.</p>
+<div class="row"><a class="btn gold sm" href="{{ url_for('web.admin_share_general') }}">🎬 Preview and post</a></div>
 <form method="post" action="{{ url_for('web.admin_share_general_auto') }}" style="margin-top:10px"><input type="hidden" name="csrf" value="{{ csrf }}">
 <label class="opt"><input type="checkbox" name="gen_on" value="1" {{ 'checked' if gon }}><span class="grow"><b>Post them automatically</b><div class="small mut">Off for now. Next: <b>{{ st.next_gen }}</b> (Nigeria time)</div></span></label>
-<div class="row" style="margin-top:6px"><label class="small">Part 1 time<br><input type="time" name="t1" value="{{ gt[1] }}" style="width:120px"></label>
-<label class="small">Part 2 time<br><input type="time" name="t2" value="{{ gt[2] }}" style="width:120px"></label>
-<label class="small">Products per part<br><input type="number" name="per" min="4" max="9" value="{{ gn }}" style="width:90px"></label></div>
+<div class="row" style="margin-top:6px"><label class="small">Time 1<br><input type="time" name="t1" value="{{ gt.get(1,'') }}" style="width:120px"></label>
+<label class="small">Time 2 (optional)<br><input type="time" name="t2" value="{{ gt.get(2,'') }}" style="width:120px"></label>
+<label class="small">Products in the Reel<br><input type="number" name="per" min="4" max="9" value="{{ gn }}" style="width:90px"></label></div>
 <button class="btn alt sm" style="margin-top:8px">Save</button></form></div>
 {% if rdy.fb or rdy.ig %}<form method="post" action="{{ url_for('web.admin_share_auto') }}" class="card" style="padding:14px;margin-bottom:12px"><input type="hidden" name="csrf" value="{{ csrf }}">
 <b>🤖 Automatic posting</b>
@@ -5681,7 +5680,7 @@ def admin_share_reel(pid):
                       p=p, name=name, take=take, style=_music_style(tone_of(p)))
 
 
-# ================================================================== the general SHOP Reel (many products, in two parts)
+# ================================================================== the general SHOP Reel (many products, one video)
 GEN_INTRO_S, GEN_OUTRO_S, GEN_PER_PRODUCT_S = 2.2, 3.0, 3.0
 
 
@@ -5699,11 +5698,18 @@ def _hhmm(v, default):
 
 
 def gen_times():
-    return {1: _hhmm(setting("auto_gen1_time", ""), "10:00"), 2: _hhmm(setting("auto_gen2_time", ""), "18:00")}
+    """The times (Nigeria) the general Reel goes out by itself. A time left empty is simply not used."""
+    out = {}
+    for n, d in ((1, "10:00"), (2, "18:00")):
+        raw = setting(f"auto_gen{n}_time", d)
+        if raw == "off":
+            continue
+        out[n] = _hhmm(raw, d)
+    return out
 
 
-def pick_general(n):
-    """n different products for one part, from a shuffled deck over the whole catalogue (no repeats until all were shown)."""
+def pick_general(n, avoid=()):
+    """n different products from a shuffled deck over the whole catalogue: nothing comes back until every product was shown."""
     import random
     elig = {r["id"]: r for r in _eligible()}
     if not elig:
@@ -5717,39 +5723,61 @@ def pick_general(n):
         if not deck or all(x in out for x in deck):
             deck = [x for x in elig if x not in out]
             random.shuffle(deck)
-        pid = next(x for x in deck if x not in out)
+        pool = [x for x in deck if x not in out and x not in avoid] or [x for x in deck if x not in out]
+        pid = pool[0]
         deck.remove(pid)
         out.append(pid)
     set_setting("auto_deck_general", json.dumps(deck))
     return out
 
 
-def general_products(part, take=0):
-    """The products of one part for today. Stored, so the preview and the post show exactly the same ones."""
-    key = f"gen_set_{time.strftime('%Y-%m-%d')}_{part}_{take}"
+def _pending():
     try:
-        ids = json.loads(setting(key, "[]") or "[]")
+        d = json.loads(setting("gen_pending", "{}") or "{}")
     except ValueError:
-        ids = []
+        d = {}
+    return d if isinstance(d, dict) else {}
+
+
+def general_set(fresh=False):
+    """The set of products for the NEXT general Reel: (products, token). It stays the same until it has been posted,
+    so the preview and the post always match. A posted set is never offered again."""
     elig = {r["id"]: r for r in _eligible()}
-    ids = [i for i in ids if i in elig]
-    if not ids:
-        ids = pick_general(gen_per_part())
-        set_setting(key, json.dumps(ids))
-        elig = {r["id"]: r for r in _eligible()}
-    return [elig[i] for i in ids if i in elig]
+    cur = _pending()
+    ids = [i for i in cur.get("ids", []) if i in elig]
+    if fresh and ids:                                       # "choose other products": the old ones go to the back of the deck
+        try:
+            deck = json.loads(setting("auto_deck_general", "[]"))
+        except ValueError:
+            deck = []
+        set_setting("auto_deck_general", json.dumps([x for x in deck if x not in ids] + ids))
+        ids = []
+    if len(ids) < min(3, len(elig)):
+        ids = pick_general(gen_per_part(), avoid=cur.get("ids", []) if fresh else ())
+        cur = {"ids": ids, "token": secrets.token_hex(4), "done": []}
+        set_setting("gen_pending", json.dumps(cur))
+    elig = {r["id"]: r for r in _eligible()}
+    return [elig[i] for i in ids if i in elig], cur.get("token", "")
 
 
-def _scene_intro_part(part):
+def general_finish(token):
+    """The set was posted everywhere it should go: the next preview shows new products."""
+    cur = _pending()
+    if cur.get("token") == token:
+        set_setting("auto_last_general", json.dumps(cur.get("ids", [])))
+        set_setting("gen_pending", "{}")
+
+
+def _scene_intro_general():
     from PIL import ImageDraw
     bg = _scene_intro()
     d = ImageDraw.Draw(bg)
-    _pill(d, f"PART {part} OF 2", _font(56), REEL_W / 2, 300)
+    _pill(d, "THE COLLECTION", _font(56), REEL_W / 2, 300)
     _centered(d, "Hijabs  •  Jilbabs  •  Textiles & more", _font(38, bold=False), 1440, (180, 180, 180))
     return bg
 
 
-def _scene_outro_general(part, site_txt, wa):
+def _scene_outro_general(site_txt, wa):
     from PIL import ImageDraw
     bg = _gradient()
     d = ImageDraw.Draw(bg)
@@ -5762,18 +5790,18 @@ def _scene_outro_general(part, site_txt, wa):
     _centered(d, "Tap the link in our bio", f2, 990, (235, 235, 235))
     if wa:
         _centered(d, f"WhatsApp {wa}", f2, 1056, (235, 235, 235))
-    _pill(d, "Watch Part 2 next" if part == 1 else "Thank you for watching", _font(48), REEL_W / 2, 1220)
+    _pill(d, "Order yours today", _font(48), REEL_W / 2, 1220)
     _centered(d, REEL_CLOSING, _font(40), 1700, REEL_GOLD)
     _centered(d, REEL_PLACE, _font(32, bold=False), 1790, (170, 170, 170))
     return bg
 
 
-def make_general_reel(part, take=0):
-    """Build the general Reel (Part 1 or 2): the shop intro, a few seconds for each product, then the order screen."""
+def make_general_reel(token=None):
+    """Build the general Reel for the next set of products: shop intro, a few seconds per product, order screen."""
     ff = _ffmpeg()
     if not ff:
         raise ReelError("The video tool (FFmpeg) is not installed on the server.")
-    prods = general_products(part, take)
+    prods, cur_token = general_set()
     if not prods:
         raise ReelError("There are no products in stock with a picture yet.")
     wa = CFG.get("WHATSAPP", "")
@@ -5787,9 +5815,8 @@ def make_general_reel(part, take=0):
     if not items:
         raise ReelError("None of the chosen products has a picture to show.")
     sig = [(i["p"]["id"], _reel_text(i["p"]["name"]), repr(reel_prices(i["p"])), i["fid"]) for i in items]
-    key = hashlib.sha256("|".join([REEL_DESIGN, "general", str(part), str(take), repr(sig), setting("web_logo"), wa,
-                                    time.strftime("%Y-%m-%d")]).encode()).hexdigest()[:12]
-    out = os.path.join(_reel_dir(), f"general{part}_{key}.mp4")
+    key = hashlib.sha256("|".join([REEL_DESIGN, "general", cur_token, repr(sig), setting("web_logo"), wa]).encode()).hexdigest()[:12]
+    out = os.path.join(_reel_dir(), f"general_{key}.mp4")
     if os.path.exists(out) and os.path.getsize(out) > 10000:
         return out
     each = min(GEN_PER_PRODUCT_S, (REEL_MAX_SECONDS - GEN_INTRO_S - GEN_OUTRO_S) / len(items))
@@ -5808,7 +5835,7 @@ def make_general_reel(part, take=0):
             files.append(f)
             durs.append(d)
             fades.append(fade)
-        add(_scene_intro_part(part), GEN_INTRO_S, "black")
+        add(_scene_intro_general(), GEN_INTRO_S, "black")
         for n, it in enumerate(items):
             p = it["p"]
             src = _load(it["path"])
@@ -5819,9 +5846,9 @@ def make_general_reel(part, take=0):
             src.close()
             add(im, each, "0xD4A94A" if n % 2 == 1 else "black")
             gc.collect()
-        add(_scene_outro_general(part, site, wa), GEN_OUTRO_S, "black")
+        add(_scene_outro_general(site, wa), GEN_OUTRO_S, "black")
         total = sum(durs)
-        seed = int(hashlib.sha256(f"general-{part}-{take}-{time.strftime('%Y%m%d')}".encode()).hexdigest()[:8], 16)
+        seed = int(hashlib.sha256(f"general-{cur_token}".encode()).hexdigest()[:8], 16)
         wav = os.path.join(work, "music.wav")
         make_music("intense", total, seed, wav)
         _encode_video(ff, work, files, durs, fades, wav, total, tmp_out)
@@ -5835,79 +5862,103 @@ def make_general_reel(part, take=0):
     return out
 
 
-_GEN_OPEN = ["🔥 AD FASHION SHOP collection, Part {part} of 2!", "✨ Fresh picks from AD FASHION SHOP. Part {part} of 2!",
-             "💛 Look what is waiting for you at AD FASHION SHOP. Part {part} of 2!", "👑 Your next favourites are here. Part {part} of 2!",
-             "🌟 AD FASHION SHOP, Part {part} of 2. Watch till the end!", "🤍 Modesty, elegance, quality. Part {part} of 2!"]
-_GEN_CLOSE = ["Tap the link in our bio to order. 🚚", "Order today, delivery anywhere in Nigeria. 🚚", "Message us on WhatsApp to order. 💬",
-              "Which one is your favourite? 👇", "Save this and share with a friend. 💛", "Limited stock, so don't wait! 🏃🏽‍♀️"]
+# ---- the caption: a hook, what is inside, a clear next step, keywords and a mix of big + local + shopping hashtags
+_GEN_HOOK = ["🔥 STOP SCROLLING! New styles just landed at AD FASHION SHOP", "😍 You will want every single one of these. AD FASHION SHOP",
+             "👑 Queens, your next outfit is in this video", "✨ Elegance you can wear every day. Watch till the end",
+             "💛 These are going FAST. See what is new at AD FASHION SHOP", "🌸 Which one is YOUR favourite? Tell us in the comments",
+             "🧕🏽 Modest. Stylish. Affordable. This is AD FASHION SHOP", "🚨 Fresh drop! Save this video before it sells out"]
+_GEN_CTA = ["📲 Tap the link in our bio to order now", "💬 Send us a message on WhatsApp to order today",
+            "🛍️ Order from the link in our bio. We deliver anywhere in Nigeria 🚚", "❤️ Save this and share with someone who loves good style",
+            "👇 Comment your favourite and we will reply with the price and how to order", "🏃🏽‍♀️ Limited stock. Order yours before it is gone"]
+_GEN_KEYWORDS = ["Hijabs, jilbabs, abayas, fabrics and more. Quality you can trust, delivered across Nigeria. 🇳🇬",
+                 "Premium hijabs, jilbabs and textiles in Bauchi, with fast delivery nationwide. 🇳🇬",
+                 "Modest fashion for women who love elegance: hijabs, jilbabs, abayas and fabrics. 🇳🇬"]
+_TAGS_BIG = ["#hijab", "#hijabstyle", "#modestfashion", "#muslimfashion", "#hijabfashion", "#modestwear", "#abaya", "#jilbab", "#fashionreels"]
+_TAGS_LOCAL = ["#nigeriafashion", "#fashionnigeria", "#arewafashion", "#northernnigeria", "#bauchi", "#hausafashion", "#naijafashion", "#nigerianstyle"]
+_TAGS_SHOP = ["#onlineshopnigeria", "#shoponline", "#fashionstore", "#hijabstore", "#ladiesfashion", "#fabricsnigeria"]
+_TAGS_REACH = ["#reels", "#explorepage", "#viral", "#trending"]
 
 
-def general_caption(part, names, n=0):
+def general_caption(names, n=0):
     import random
-    rnd = random.Random(f"gen-{part}-{n}-{time.strftime('%Y%m%d')}")
+    rnd = random.Random(f"gen-{n}-{time.strftime('%Y%m%d%H')}")
     shown = [x for x in names if x][:4]
-    mid = ("Featuring: " + ", ".join(shown) + ".") if shown else ""
-    tags = " ".join(rnd.sample(_REEL_REACH, 4)) + " #ADFashion #ADFashionHijabs #BauchiFashion"
-    return "\n".join(x for x in (rnd.choice(_GEN_OPEN).format(part=part), mid, rnd.choice(_GEN_CLOSE), tags) if x)
+    mid = ("Inside: " + ", ".join(shown) + (" and more!" if len(names) > len(shown) else "")) if shown else ""
+    tags = ["#ADFashion", "#ADFashionShop"] + rnd.sample(_TAGS_BIG, 3) + rnd.sample(_TAGS_LOCAL, 3) + rnd.sample(_TAGS_SHOP, 2) + rnd.sample(_TAGS_REACH, 2)
+    return "\n\n".join(x for x in (rnd.choice(_GEN_HOOK), mid, rnd.choice(_GEN_CTA), rnd.choice(_GEN_KEYWORDS), " ".join(tags)) if x)
 
 
-def fresh_general_caption(part, names, plat):
+def fresh_general_caption(names, plat):
     label = "Facebook" if plat == "fb" else "Instagram"
-    used = used_captions(f"general{part}", label)
+    used = used_captions("general", label)
     cap = ""
-    for n in range(200):
-        cap = general_caption(part, names, n)
+    for n in range(400):
+        cap = general_caption(names, n)
         if _norm(cap) not in used:
             return cap
-    return cap + " " + time.strftime("%d%b")
+    return cap + " " + time.strftime("%d%b%H%M")
 
 
-def do_general_reel(part, want, take=0, caps=None, auto=0):
-    """Make the general Reel and send it. Nothing is kept: the video is removed as soon as it has been sent."""
+def do_general_reel(want, caps=None, auto=0):
+    """Make the general Reel for the next set and send it. Nothing is kept: the video is removed as soon as it has been sent.
+    A platform that already has this set is skipped, so nothing is posted twice."""
     rdy, caps, out, info = social_ready(), caps or {}, [], {}
-    path = make_general_reel(part, take)
-    prods = general_products(part, take)
+    prods, token = general_set()
+    path = make_general_reel()
     names = [p["name"] for p in prods]
     cover_url, cover_bytes = _reel_cover(prods[0]["id"]) if prods else (None, None)
     url = pub_vid_url(path)
-    pid = f"general{part}"
+    cur = _pending()
+    done = list(cur.get("done", [])) if cur.get("token") == token else []
+    ok_all = True
     try:
         for plat in ("fb", "ig"):
             if plat not in want or not rdy[plat]:
                 continue
             label = "Facebook" if plat == "fb" else "Instagram"
+            if plat in done:
+                out.append(f"ℹ️ {label} already has this Reel")
+                continue
             caption = (caps.get(plat) or "").strip()
-            if not caption or _norm(caption) in used_captions(pid, label):
-                caption = fresh_general_caption(part, names, plat)
+            if not caption or _norm(caption) in used_captions("general", label):
+                caption = fresh_general_caption(names, plat)
             try:
                 if plat == "fb":
                     rid = post_facebook_reel(url, caption[:2100], info, cover_bytes)
                 else:
                     rid = post_instagram_reel(url, caption[:2100], cover_url)
                 db().execute("INSERT INTO social_posts(product_id,platform,status,remote_id,caption,auto) VALUES(?,?,?,?,?,?)",
-                             (pid, label, "ok", str(rid), caption[:2100], auto))
-                out.append(f"✅ Posted Shop Reel Part {part} to {label}")
+                             ("general", label, "ok", str(rid), caption[:2100], auto))
+                out.append(f"✅ Posted the Shop Reel to {label}")
+                done.append(plat)
+                cur2 = _pending()
+                if cur2.get("token") == token:                   # remember who already has it, so a retry never posts twice
+                    cur2["done"] = done
+                    set_setting("gen_pending", json.dumps(cur2))
             except Exception as e:
+                ok_all = False
                 db().execute("INSERT INTO social_posts(product_id,platform,status,error,auto) VALUES(?,?,?,?,?)",
-                             (pid, label, "failed", ("Reel: " + str(e))[:300], auto))
+                             ("general", label, "failed", ("Reel: " + str(e))[:300], auto))
                 out.append(f"❌ {label} Shop Reel failed: {e}")
             db().commit()
+        if ok_all and done:
+            general_finish(token)                               # the next general Reel gets new products
     finally:
         _discard_video(path, delay=900 if info.get("late_fetch") else 0)
     return out
 
 
-def run_general_auto(part, only=None):
-    """Automatic post of one part. Returns (a small product-like dict, messages)."""
+def run_general_auto(only=None):
+    """Automatic post of the general Reel. Returns (a small product-like dict, messages)."""
     rdy = social_ready()
     want = [pl for pl in ("fb", "ig") if setting("auto_" + pl, "1") == "1" and rdy[pl] and (only is None or pl in only)]
-    me = {"id": f"general{part}", "name": f"Shop Reel Part {part}"}
+    me = {"id": "general", "name": "Shop Reel"}
     if not want:
         return me, ["❌ Auto-post: connect Facebook or Instagram first."]
     if not site_base():
         return me, ["❌ Auto-post: the app address is unknown. Set SITE_URL in Railway or open the Share page once."]
     try:
-        msgs = do_general_reel(part, want, auto=1)
+        msgs = do_general_reel(want, auto=1)
     except Exception as e:
         msgs = [f"❌ {me['name']}: {e}"]
     try:
@@ -5918,36 +5969,43 @@ def run_general_auto(part, only=None):
     return me, msgs
 
 
-@bp.route("/admin/share/general/<int:part>", methods=["GET", "POST"])
+@bp.route("/admin/share/general", methods=["GET", "POST"])
 @admin_required
-def admin_share_general(part):
-    if part not in (1, 2):
-        abort(404)
-    take = to_int(request.values.get("n"), 0) or 0
+def admin_share_general():
     if request.method == "POST":
+        _, token = general_set()
+        if request.form.get("set") != token:                      # an old page: that set was already posted or replaced
+            flash("That set was already posted or changed. Here is the next one.")
+            return redirect(url_for("web.admin_share_general"))
         rdy = social_ready()
         want = [pl for pl in ("fb", "ig") if setting("auto_" + pl, "1") == "1" and rdy[pl]]
         if not want:
             flash("Connect Facebook or Instagram first.")
-        elif queue_job("general", f"general{part}", want, take=take) is None:
+        elif queue_job("general", "general", want) is None:
             flash("This Reel is already being sent. Please wait a moment.")
         else:
             flash("📤 Sending the Shop Reel in the background. You can leave the app. We will notify you when it is done.")
         return redirect(url_for("web.admin_share"))
     try:
-        path = make_general_reel(part, take)
+        path = make_general_reel()
     except ReelError as e:
         flash(f"Could not make the video: {e}")
         return redirect(url_for("web.admin_share"))
-    names = [p["name"] for p in general_products(part, take)]
+    prods, token = general_set()
     return admin_page("Shop Reel preview", """<p><a href="{{ url_for('web.admin_share') }}">‹ Share</a></p>
-<h2>🎬 Shop Reel · Part {{ part }} of 2</h2>
+<h2>🎬 Shop Reel</h2>
 <video src="{{ url_for('web.admin_reelfile', name=name) }}" controls playsinline preload="metadata" style="width:100%;max-width:340px;border-radius:14px;background:#000"></video>
-<p class="mut small">{{ names|length }} products: {{ names|join(', ') }}. This is exactly what will be posted, with the intense music.</p>
-<form method="post" class="row" style="margin-top:10px"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="n" value="{{ take }}">
-<button class="btn gold">📣 Post Part {{ part }} now</button>
-<a class="btn alt" href="{{ url_for('web.admin_share_general', part=part, n=take+1) }}">🔄 Choose other products</a></form>""",
-                      part=part, name=os.path.basename(path), names=names, take=take)
+<p class="mut small">{{ names|length }} products: {{ names|join(', ') }}. These are products that were not in the last Shop Reel. This is exactly what will be posted, with the intense music.</p>
+<div class="row" style="margin-top:10px"><form method="post"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="set" value="{{ token }}"><button class="btn gold">📣 Post it now</button></form>
+<form method="post" action="{{ url_for('web.admin_share_general_other') }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn alt">🔄 Choose other products</button></form></div>""",
+                      name=os.path.basename(path), names=[p["name"] for p in prods], token=token)
+
+
+@bp.post("/admin/share/general/other")
+@admin_required
+def admin_share_general_other():
+    general_set(fresh=True)
+    return redirect(url_for("web.admin_share_general"))
 
 
 @bp.post("/admin/share/general/auto")
@@ -5955,12 +6013,13 @@ def admin_share_general(part):
 def admin_share_general_auto():
     was_on = auto_gen_on()
     set_setting("auto_gen_on", "1" if request.form.get("gen_on") else "0")
-    set_setting("auto_gen1_time", _hhmm(request.form.get("t1"), gen_times()[1]))
-    set_setting("auto_gen2_time", _hhmm(request.form.get("t2"), gen_times()[2]))
+    for n in (1, 2):
+        raw = (request.form.get(f"t{n}") or "").strip()
+        set_setting(f"auto_gen{n}_time", _hhmm(raw, "off") if raw else "off")
     set_setting("gen_per_part", str(max(4, min(9, to_int(request.form.get("per"), 8) or 8))))
     if not was_on and auto_gen_on():                         # switching on: do not fire a slot that has just passed
         for kind, s in _due_slots(datetime.now(LAGOS)):
             set_setting("auto_done_" + _slot_key(kind, s), "1")
     t = gen_times()
-    flash(f"Saved. Shop Reel: {'on, Part 1 at ' + t[1] + ' and Part 2 at ' + t[2] + ' (Nigeria time)' if auto_gen_on() else 'off. Post it by hand whenever you like.'}")
+    flash("Saved. Shop Reel: " + (("on, at " + " and ".join(t.values()) + " (Nigeria time)") if auto_gen_on() and t else "off. Post it by hand whenever you like."))
     return redirect(url_for("web.admin_share"))
