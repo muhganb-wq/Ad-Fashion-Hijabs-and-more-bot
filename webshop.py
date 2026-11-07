@@ -1342,13 +1342,15 @@ if(ok){
 var dp=null;window.addEventListener('beforeinstallprompt',function(e){e.preventDefault();dp=e;var b=document.getElementById('inst');var x=false;try{x=sessionStorage.getItem('instx')}catch(_){}if(!x)b.style.display='flex';});
 document.getElementById('instbtn').onclick=function(){if(dp){dp.prompt();dp=null;}document.getElementById('inst').style.display='none';};
 document.getElementById('instx').onclick=function(){document.getElementById('inst').style.display='none';try{sessionStorage.setItem('instx','1')}catch(e){}};
-function shareCard(b){var card=b.getAttribute('data-card'),text=b.getAttribute('data-text')||'';b.disabled=true;var old=b.innerHTML;b.innerHTML='Preparing…';
+function shareCard(b){var card=b.getAttribute('data-card'),more=(b.getAttribute('data-more')||'').split(',').filter(Boolean),text=b.getAttribute('data-text')||'';b.disabled=true;var old=b.innerHTML;b.innerHTML='Preparing…';
 function done(){b.disabled=false;b.innerHTML=old}
 function fallback(){window.open('https://wa.me/?text='+encodeURIComponent(text),'_blank');done()}
-fetch(card,{credentials:'same-origin'}).then(function(r){if(!r.ok)throw 0;return r.blob()}).then(function(bl){
-var f=new File([bl],'product.jpg',{type:'image/jpeg'});
-if(navigator.canShare&&navigator.canShare({files:[f]})){return navigator.share({files:[f],text:text}).then(done,function(e){if(e&&e.name==='AbortError')done();else fallback()})}
-var a=document.createElement('a');a.href=URL.createObjectURL(bl);a.download='product.jpg';document.body.appendChild(a);a.click();a.remove();setTimeout(fallback,400)}).catch(fallback)}
+var urls=[card].concat(more);
+Promise.all(urls.map(function(u,i){return fetch(u,{credentials:'same-origin'}).then(function(r){if(!r.ok)throw 0;return r.blob()}).then(function(bl){return new File([bl],'product'+(i+1)+'.jpg',{type:'image/jpeg'})}).catch(function(){return i==0?Promise.reject():null})})).then(function(fs){
+fs=fs.filter(Boolean);if(!fs.length)throw 0;
+if(navigator.canShare&&navigator.canShare({files:fs})){return navigator.share({files:fs,text:text}).then(done,function(e){if(e&&e.name==='AbortError')done();else fallback()})}
+if(navigator.canShare&&navigator.canShare({files:[fs[0]]})){return navigator.share({files:[fs[0]],text:text}).then(done,function(e){if(e&&e.name==='AbortError')done();else fallback()})}
+fs.forEach(function(f,i){setTimeout(function(){var a=document.createElement('a');a.href=URL.createObjectURL(f);a.download=f.name;document.body.appendChild(a);a.click();a.remove()},i*350)});setTimeout(fallback,400+fs.length*350)}).catch(fallback)}
 </script></body></html>"""
 
 PCARD = """{% macro pcard(p) %}<a class="card pc" href="{{ url_for('web.product', pid=p['id']) }}">{% if p['sold_out'] %}<span class="nb" style="background:#b3261e;color:#fff">SOLD OUT</span>{% elif is_back(p) %}<span class="nb" style="background:#1f7a3d;color:#fff">BACK IN STOCK</span>{% elif p['is_new'] %}<span class="nb">NEW</span>{% endif %}
@@ -1366,7 +1368,7 @@ def unread_count():
 def page(title, body_tpl, tab="", **ctx):
     common = dict(csrf=csrf_token(), money=money, cfg=CFG, user=current_user(), status_label=STATUS_LABEL,
                   icon=svg_icon, display_price=display_price, app_name=APP_NAME, is_admin=is_admin_user(),
-                  fabric_name=FABRIC_NAME, fq=fmt_qty, unit_word=UNIT_WORD, is_back=is_back)
+                  fabric_name=FABRIC_NAME, fq=fmt_qty, unit_word=UNIT_WORD, is_back=is_back, share_more=share_more)
     body = render_template_string(PCARD + body_tpl, **common, **ctx)
     return render_template_string(BASE, title=title, body=body, tab=tab, cart_count=sum(cart().values()),
                                   unread=unread_count(), **{k: common[k] for k in ("user", "icon", "app_name", "is_admin", "csrf")})
@@ -1825,6 +1827,38 @@ def share_text(p):
     return "\n".join(lines)
 
 
+SHARE_MAX_PHOTOS = 6                                   # the card + up to 5 more pictures per share
+
+
+def share_more(pid):
+    """Comma-separated links to the other gallery pictures (made on the spot, nothing is stored)."""
+    try:
+        n = len([x for x in product_photos(pid) if not x["sold_out"]])
+    except Exception:
+        return ""
+    return ",".join(url_for("web.product_share_photo", pid=pid, i=i) for i in range(1, min(n, SHARE_MAX_PHOTOS)))
+
+
+@bp.get("/p/<pid>/share/<int:i>.jpg")
+def product_share_photo(pid, i):
+    """One gallery picture with the shop logo, ready to share (the first picture is in the card)."""
+    p = db().execute("SELECT * FROM products WHERE id=? AND active=1", (pid,)).fetchone()
+    if not p:
+        abort(404)
+    ph = product_photos(pid)
+    ph = [x for x in ph if not x["sold_out"]] or ph
+    if i < 0 or i >= len(ph):
+        abort(404)
+    path = fetch_file(ph[i]["file_id"])
+    if not path:
+        abort(404)
+    from PIL import Image
+    emblem = _brand_logo_small()
+    buf = io.BytesIO()
+    brand_frame(Image.open(path).convert("RGB"), emblem).save(buf, "JPEG", quality=88)
+    return Response(buf.getvalue(), mimetype="image/jpeg", headers={"Cache-Control": "no-cache"})
+
+
 @bp.get("/p/<pid>/card.jpg")
 def product_card(pid):
     """A ready-to-share picture: the product photo with its name and prices underneath."""
@@ -1840,13 +1874,15 @@ def product_card(pid):
         pic = Image.open(path).convert("RGB")
     except Exception:
         pic = Image.new("RGB", (W, W), (240, 236, 228))
+    emblem = _brand_logo_small()
+    pic = place_round_logo(pic, _BRAND_LOGO.get("big"))          # round logo on the picture itself (only where there is calm space)
     sc = min(W / pic.size[0], 1350 / pic.size[1])
     pic = pic.resize((max(1, int(pic.size[0] * sc)), max(1, int(pic.size[1] * sc))))
     rows = [(FABRIC_NAME[k].replace(" Fabric", ""), money(v)) for k, v in fabric_prices(pid).items()]
     if not rows:
         rows = [("", money(p["price"]))]
     fn, fl, fa = _font(50), _font(40, bold=False), _font(44)
-    foot = 40 + 70 + len(rows) * 62 + 30 + 46 + 30
+    foot = 40 + 70 + len(rows) * 62 + 30 + 118 + 24
     im = Image.new("RGB", (W, pic.size[1] + foot), (255, 255, 255))
     im.paste(pic, ((W - pic.size[0]) // 2, 0))
     d = ImageDraw.Draw(im)
@@ -1866,7 +1902,13 @@ def product_card(pid):
         else:
             d.text((40, y - 3), amt, font=fa, fill=(230, 195, 107))
         y += 62
-    d.text((40, y + 14), APP_NAME, font=_font(30, bold=False), fill=(170, 170, 170))
+    d.line([(40, y + 12), (W - 40, y + 12)], fill=(201, 162, 75), width=2)
+    bx = 40
+    if emblem is not None:                                         # brand strip: logo + shop name, as on Facebook and Instagram posts
+        im.paste(emblem.convert("RGB"), (bx, y + 30), emblem.split()[-1])
+        bx += 104 + 24
+    d.text((bx, y + 36), "AD FASHION SHOP", font=_font(44), fill=(214, 168, 64))
+    d.text((bx, y + 92), "Modesty  •  Elegance  •  Quality", font=_font(26, bold=False), fill=(205, 205, 205))
     if p["sold_out"]:
         d.rounded_rectangle((W - 330, 24, W - 24, 100), radius=18, fill=(179, 38, 30))
         d.text((W - 305, 40), "SOLD OUT", font=_font(40), fill=(255, 255, 255))
@@ -1912,7 +1954,7 @@ def product(pid):
 {% if by_unit %}<p class="mut small" style="margin:.4em 0 0">You can use decimals, for example 2.5.</p>{% endif %}
 {% if p['sold_out'] %}<p class="tag bad" style="display:block;margin-top:14px;padding:10px;text-align:center"><b>Sold out for now</b> — save it and we will tell you when it is back in stock.</p>{% endif %}
 <div class="row" style="margin-top:18px">{% if p['sold_out'] %}<button class="btn grow" type="button" disabled style="opacity:.5">Sold out</button>{% else %}<button class="btn gold grow">{{ icon('cart') }} Add to cart</button>{% endif %}
-<button type="button" class="btn wa" data-card="{{ url_for('web.product_card', pid=p['id']) }}" data-text="{{ share_msg }}" onclick="shareCard(this)">Share</button></div></form>
+<button type="button" class="btn wa" data-card="{{ url_for('web.product_card', pid=p['id']) }}" data-more="{{ share_more(p['id']) }}" data-text="{{ share_msg }}" onclick="shareCard(this)">Share</button></div></form>
 <form method="post" action="{{ url_for('web.wish', pid=p['id']) }}" style="margin-top:10px"><input type="hidden" name="csrf" value="{{ csrf }}">
 <button class="btn alt sm">{{ icon('heart') }} {{ 'Saved to wishlist' if wished else 'Save for later' }}</button></form>
 </div></div>
@@ -4358,7 +4400,7 @@ def admin_share():
 {% if p['photo_file_id'] %}<img src="{{ url_for('web.img', fid=p['photo_file_id']) }}" alt="" style="width:64px;height:64px;object-fit:cover;border-radius:10px;flex:none">{% endif %}
 <div class="grow" style="min-width:0"><b>{{ p['name'] }}</b>{% if p['sold_out'] %} <span class="tag bad">Sold out</span>{% endif %}<div class="small mut">{{ display_price(p) }}</div>
 {% if p['last_post'] %}<div class="small" style="color:#2a8a4a">✓ Posted {{ p['last_post'][:10] }}</div>{% endif %}</div><span class="btn alt sm">Share ›</span></a>
-<button type="button" class="btn wa sm" title="WhatsApp / Status with picture" data-card="{{ url_for('web.product_card', pid=p['id']) }}" data-text="{{ share_text(p) }}" onclick="shareCard(this)">🟢</button>
+<button type="button" class="btn wa sm" title="WhatsApp / Status with picture" data-card="{{ url_for('web.product_card', pid=p['id']) }}" data-more="{{ share_more(p['id']) }}" data-text="{{ share_text(p) }}" onclick="shareCard(this)">🟢</button>
 <a class="btn gold sm" href="{{ url_for('web.admin_share_reel', pid=p['id']) }}" title="Post as a Reel">🎬</a></div>{% endfor %}
 {% if recent %}<h3 style="margin-top:18px">Recent posts</h3>{% for r in recent %}<div class="small" style="margin-bottom:4px">
 {{ '✅' if r['status']=='ok' else '❌' }} {{ r['platform']|title }}{% if r['auto'] %} 🤖{% endif %} · {{ r['name'] or r['product_id'] }} · {{ r['created_at'][:16] }}{% if r['error'] %}<div class="mut">{{ r['error'] }}</div>{% endif %}</div>{% endfor %}{% endif %}""",
@@ -4400,7 +4442,7 @@ def admin_share_product(pid):
 {% if last %}<div class="small" style="color:#b26a00">Already posted on {{ last[:10] }}</div>{% endif %}</div></div></div>
 <div class="card" style="padding:12px;margin-top:10px"><b>🟢 WhatsApp</b>
 <p class="mut small" style="margin:4px 0 8px">Sends the picture with the name and prices. In the list that opens choose a chat, a group, or <b>My status</b>.</p>
-<button type="button" class="btn wa sm" data-card="{{ url_for('web.product_card', pid=p['id']) }}" data-text="{{ wa_text }}" onclick="shareCard(this)">Share picture on WhatsApp / Status</button></div>
+<button type="button" class="btn wa sm" data-card="{{ url_for('web.product_card', pid=p['id']) }}" data-more="{{ share_more(p['id']) }}" data-text="{{ wa_text }}" onclick="shareCard(this)">Share picture on WhatsApp / Status</button></div>
 <form method="post" class="card" style="padding:14px;margin-top:10px"><input type="hidden" name="csrf" value="{{ csrf }}">
 {% if photos %}<label class="l">Photos to post ({{ photos|length }}){% if photos|length > 1 %} · they go out as one swipe post{% endif %}</label>
 <div style="display:flex;gap:8px;overflow-x:auto;padding-bottom:8px;margin-bottom:8px">{% for f in photos %}<label style="flex:none;position:relative;display:block">
