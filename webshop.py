@@ -4021,7 +4021,11 @@ def run_job(flask_app, jid):
             want, picked, caps = json.loads(j["want"]), json.loads(j["picked"]), json.loads(j["caps"])
             p = db().execute("SELECT * FROM products WHERE id=?", (j["product_id"],)).fetchone() if j["product_id"] else None
             pushed = False
-            if j["kind"] == "next":
+            if j["kind"] == "general":
+                part = to_int((j["product_id"] or "general1")[7:], 1) or 1
+                p = {"id": j["product_id"], "name": f"Shop Reel Part {part}"}
+                msgs = do_general_reel(part, want, take=j["take"] or 0, caps=caps)
+            elif j["kind"] == "next":
                 p, msgs = run_auto_post("manual")
                 pushed = True                                    # run_auto_post already tells the admin
             elif not p:
@@ -4074,7 +4078,7 @@ def recent_jobs(limit=5):
             msgs = json.loads(r["result"] or "[]")
         except ValueError:
             msgs = []
-        out.append({"id": r["id"], "name": r["name"] or "Next product", "kind": r["kind"], "status": r["status"],
+        out.append({"id": r["id"], "name": r["name"] or (("Shop Reel Part " + (r["product_id"] or "")[7:]) if (r["product_id"] or "").startswith("general") else "Next product"), "kind": r["kind"], "status": r["status"],
                     "msgs": msgs, "at": (r["finished_at"] or r["created_at"] or "")[11:16]})
     return out
 
@@ -4194,6 +4198,12 @@ def _due_slots(now):
             s = now.replace(hour=h, minute=REEL_MINUTE, second=0, microsecond=0)
             if s <= now < s + timedelta(minutes=REEL_GRACE_MIN):
                 out.append(("reel", s))
+    if auto_gen_on():
+        for part, tm in gen_times().items():
+            h, m = int(tm[:2]), int(tm[3:])
+            s = now.replace(hour=h, minute=m, second=0, microsecond=0)
+            if s <= now < s + timedelta(minutes=REEL_GRACE_MIN):
+                out.append((f"gen{part}", s))
     return out
 
 
@@ -4205,14 +4215,17 @@ def _run_slot(flask_app, kind, skey):
     with flask_app.app_context():
         jid = None
         try:
-            jid = db().execute("INSERT INTO share_jobs(kind,status) VALUES(?,'working')", ("autoreel" if kind == "reel" else "auto",)).lastrowid
+            jid = db().execute("INSERT INTO share_jobs(kind,status) VALUES(?,'working')", ("autoreel" if kind == "reel" or kind.startswith("gen") else "auto",)).lastrowid
             db().commit()
             part = {}
             try:
                 part = json.loads(setting("auto_part_" + skey, "{}") or "{}")
             except ValueError:
                 part = {}
-            p, msgs = run_auto_post(skey, reel=(kind == "reel"), only=part.get("only"), pid=part.get("pid"))
+            if kind.startswith("gen"):
+                p, msgs = run_general_auto(to_int(kind[3:], 1) or 1, only=part.get("only"))
+            else:
+                p, msgs = run_auto_post(skey, reel=(kind == "reel"), only=part.get("only"), pid=part.get("pid"))
             good = [m for m in msgs if m.startswith("✅")]
             bad = [m for m in msgs if m.startswith("❌")]
             status = "done" if good and not bad else ("partial" if good else "failed")
@@ -4223,7 +4236,7 @@ def _run_slot(flask_app, kind, skey):
                          (p["id"] if p else "", status, json.dumps(msgs), jid))
             if good and not bad:                           # finished only when every wanted platform has it
                 set_setting("auto_done_" + skey, "1")
-            set_setting("auto_last", f"{datetime.now(LAGOS):%d %b %H:%M} · {'Reel' if kind == 'reel' else 'Photo'} · "
+            set_setting("auto_last", f"{datetime.now(LAGOS):%d %b %H:%M} · {'Shop Reel' if kind.startswith('gen') else 'Reel' if kind == 'reel' else 'Photo'} · "
                                      f"{p['name'] if p else '-'} · {status}")
             db().commit()
         except Exception as e:
@@ -4354,7 +4367,18 @@ def auto_status():
                 if s > now:
                     return f"{s:%a %H:%M}"
         return "off"
-    return {"alive": age is not None and age < 90, "age": age, "last": setting("auto_last", ""), "err": setting("auto_err", ""),
+    def nxt_gen():
+        if not auto_gen_on():
+            return "off"
+        best = []
+        for part, tm in gen_times().items():
+            for d in (0, 1):
+                s = (now + timedelta(days=d)).replace(hour=int(tm[:2]), minute=int(tm[3:]), second=0, microsecond=0)
+                if s > now:
+                    best.append((s, part)); break
+        best.sort()
+        return " · ".join(f"Part {pt} {s:%a %H:%M}" for s, pt in best) or "off"
+    return {"next_gen": nxt_gen(), "alive": age is not None and age < 90, "age": age, "last": setting("auto_last", ""), "err": setting("auto_err", ""),
             "next_photo": nxt("photo"), "next_reel": nxt("reel")}
 
 
@@ -4408,11 +4432,20 @@ def admin_share():
 {% if rdy.fb %}<span class="tag g">Facebook · {{ fb_name }}</span>{% endif %} {% if rdy.ig %}<span class="tag g">Instagram · @{{ ig_name }}</span>{% endif %}
 · <a href="{{ url_for('web.admin_share', refresh=1) }}">↻ Refresh names</a> · <a href="{{ url_for('web.admin_share_connect') }}">Reconnect</a></p>{% endif %}
 {% if jobs %}<div class="card" style="padding:12px;margin-bottom:12px" id="jobs"><b>📤 Sending</b>
-{% for j in jobs %}<div class="small" style="margin-top:6px"><b>{{ j['name'] }}</b>{% if j['kind'] in ('reel','autoreel') %} 🎬{% endif %}{% if j['kind'] in ('auto','autoreel') %} 🤖{% endif %} · {{ j['at'] }}
+{% for j in jobs %}<div class="small" style="margin-top:6px"><b>{{ j['name'] }}</b>{% if j['kind'] in ('reel','autoreel','general') %} 🎬{% endif %}{% if j['kind'] in ('auto','autoreel') %} 🤖{% endif %} · {{ j['at'] }}
 {% if j['status'] in ('queued','working') %}<span style="color:#b26a00">⏳ sending…</span>{% elif j['status']=='done' %}<span style="color:#2a8a4a">✅ sent</span>{% elif j['status']=='partial' %}<span style="color:#b26a00">⚠️ partly sent</span>{% else %}<span style="color:#c0392b">❌ not sent</span>{% endif %}
 {% for m in j['msgs'] %}<div class="mut">{{ m }}</div>{% endfor %}</div>{% endfor %}</div>
 {% if busy %}<script>setTimeout(function(){location.reload()},4000);</script>{% endif %}{% endif %}
 <script>(function(){var s0="{{ sig }}";setInterval(function(){fetch("{{ url_for('web.admin_share_pulse') }}",{credentials:"same-origin"}).then(function(r){return r.json()}).then(function(d){if(d.sig!==s0)location.reload()}).catch(function(){})},10000)})();</script>
+<div class="card" style="padding:14px;margin-bottom:12px"><b>🎬 Shop Reel: many products in 2 parts</b>
+<p class="small mut" style="margin:6px 0">One Reel for the whole shop with intense music. Part 1 and Part 2 show different products. Made when you post, removed after sending.</p>
+<div class="row"><a class="btn gold sm" href="{{ url_for('web.admin_share_general', part=1) }}">🎬 Part 1</a><a class="btn gold sm" href="{{ url_for('web.admin_share_general', part=2) }}">🎬 Part 2</a></div>
+<form method="post" action="{{ url_for('web.admin_share_general_auto') }}" style="margin-top:10px"><input type="hidden" name="csrf" value="{{ csrf }}">
+<label class="opt"><input type="checkbox" name="gen_on" value="1" {{ 'checked' if gon }}><span class="grow"><b>Post them automatically</b><div class="small mut">Off for now. Next: <b>{{ st.next_gen }}</b> (Nigeria time)</div></span></label>
+<div class="row" style="margin-top:6px"><label class="small">Part 1 time<br><input type="time" name="t1" value="{{ gt[1] }}" style="width:120px"></label>
+<label class="small">Part 2 time<br><input type="time" name="t2" value="{{ gt[2] }}" style="width:120px"></label>
+<label class="small">Products per part<br><input type="number" name="per" min="4" max="9" value="{{ gn }}" style="width:90px"></label></div>
+<button class="btn alt sm" style="margin-top:8px">Save</button></form></div>
 {% if rdy.fb or rdy.ig %}<form method="post" action="{{ url_for('web.admin_share_auto') }}" class="card" style="padding:14px;margin-bottom:12px"><input type="hidden" name="csrf" value="{{ csrf }}">
 <b>🤖 Automatic posting</b>
 <p class="small" style="margin:6px 0">{% if st.alive %}<span class="tag g">● Running</span>{% else %}<span class="tag bad">● Not running yet</span> <span class="mut">(it starts by itself; open this page again in a minute)</span>{% endif %}
@@ -4438,7 +4471,7 @@ def admin_share():
 {{ '✅' if r['status']=='ok' else '❌' }} {{ r['platform']|title }}{% if r['auto'] %} 🤖{% endif %} · {{ r['name'] or r['product_id'] }} · {{ r['created_at'][:16] }}{% if r['error'] %}<div class="mut">{{ r['error'] }}</div>{% endif %}</div>{% endfor %}{% endif %}""",
                       rdy=rdy, prods=prods, share_text=share_text, recent=recent, fb_name=setting("meta_page_name"), ig_name=setting("meta_ig_name"),
                       af=setting("auto_fb", "1") == "1", ai=setting("auto_ig", "1") == "1",
-                      st=auto_status(), pon=auto_photo_on(), ron=auto_reel_on(), phours=photo_hours(), rhours=reel_hours(),
+                      st=auto_status(), gon=auto_gen_on(), gt=gen_times(), gn=gen_per_part(), pon=auto_photo_on(), ron=auto_reel_on(), phours=photo_hours(), rhours=reel_hours(),
                       nxt=pick_auto_product("reel"), jobs=_jobs, busy=any(j["status"] in ("queued", "working") for j in _jobs), sig=_job_sig())
 
 
@@ -4734,6 +4767,9 @@ def make_music(style, seconds, seed, path):
         elif kind == "pad":
             w = sum(np.sin(2 * np.pi * f * (1 + d) * t) for d in (-0.003, 0, 0.003)) / 3 + 0.25 * np.sin(2 * np.pi * 2 * f * t)
             env = np.minimum(1, t / 0.4) * np.minimum(1, np.maximum(0, (dur - t)) / 0.4)
+        elif kind == "lead":      # bright, buzzy hook that cuts through a phone speaker
+            w = sum(np.sin(2 * np.pi * k * f * t) / k for k in range(1, 7))
+            env = np.exp(-t * 5.0) * np.minimum(1, t / 0.003)
         elif kind == "bass":
             w = np.sin(2 * np.pi * f * t) + 0.35 * np.sin(2 * np.pi * 2 * f * t) + 0.12 * np.sin(2 * np.pi * 3 * f * t)
             env = np.exp(-t * 3.0) * np.minimum(1, t / 0.01)
@@ -4765,6 +4801,8 @@ def make_music(style, seconds, seed, path):
 
     if style == "soft":
         bpm, prog = 76, [("Am", [57, 60, 64]), ("F", [53, 57, 60]), ("C", [60, 64, 67]), ("G", [55, 59, 62])]
+    elif style == "intense":
+        bpm, prog = 128, [("Am", [57, 60, 64]), ("F", [53, 57, 60]), ("C", [60, 64, 67]), ("G", [55, 59, 62])]
     elif style == "lively":
         bpm, prog = 104, [("Dm", [50, 53, 57]), ("Bb", [46, 50, 53]), ("F", [53, 57, 60]), ("C", [48, 52, 55])]
     else:
@@ -4788,6 +4826,29 @@ def make_music(style, seconds, seed, path):
                 put(drums, hat(0.09), t0 + s_ * step, 0.22)
             for s_ in range(0, 16, 2):
                 put(drums, hat(), t0 + s_ * step, 0.07)
+        elif style == "intense":
+            root = ch[0] - 24
+            for s_ in (0, 4, 8, 12):                                   # four on the floor
+                put(drums, kick(), t0 + s_ * step, 0.72)
+            for s_ in (4, 12):
+                put(drums, clap(), t0 + s_ * step, 0.55)
+            for s_ in range(16):
+                put(drums, hat(0.035), t0 + s_ * step, 0.13 if s_ % 2 == 0 else 0.07)
+            for s_ in (2, 6, 10, 14):                                  # open off-beat hats
+                put(drums, hat(0.11), t0 + s_ * step, 0.20)
+            for s_ in (0, 2, 3, 6, 8, 10, 11, 14):                     # rolling bass
+                put(melodic, tone(root + 12, step * 1.6, "sub"), t0 + s_ * step, 0.50 if s_ in (0, 8) else 0.34)
+            shift = ch[0] - 57                                         # one simple hook that follows the chords
+            for s_, k_ in zip((0, 3, 6, 8, 10, 12, 14), (3, 3, 4, 3, 2, 0, 2)):
+                put(melodic, tone(penta[k_] + shift, 0.32, "lead"), t0 + s_ * step, 0.20)
+            for m in ch:
+                put(melodic, tone(m, bar, "pad"), t0, 0.06)
+            if b % 4 == 3:                                             # snare roll + riser into the next phrase
+                for s_ in range(8, 16):
+                    put(drums, snare(), t0 + s_ * step, 0.18 + 0.05 * (s_ - 8))
+                ln = int(step * 8 * sr)
+                rise = rng.standard_normal(ln) * np.linspace(0.0, 0.35, ln) ** 2
+                put(drums, rise - np.convolve(rise, np.ones(8) / 8, "same"), t0 + 8 * step, 0.9)
         elif style == "lively":
             root = ch[0] - 12
             for s_ in (0, 6, 10):
@@ -5293,6 +5354,53 @@ def _motion(i, frames, w, h):
 
 
 # ---------------------------------------------------------------- put it together with ffmpeg
+def _encode_video(ff, work, files, durs, fades, wav, total, tmp_out):
+    """Turn the finished scene pictures + music into one MP4 (one small ffmpeg at a time keeps memory low)."""
+    import subprocess
+    def run(cmd):
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if r.returncode != 0:
+            why = (r.stderr or "").strip()[-250:]
+            if r.returncode < 0 or not why:
+                why = f"the video tool was stopped (code {r.returncode}), most likely the server ran out of memory. " + why
+            raise ReelError("Video maker error: " + why)
+
+    def render(w, h, rate="1500k"):
+        """One small clip per picture (one ffmpeg at a time keeps memory low), joined without re-encoding."""
+        clips = []
+        for i, f in enumerate(files):
+            d = durs[i]
+            frames = int(round(d * REEL_FPS))
+            vf = (f"scale={int(w * 1.1)}:{int(h * 1.1)},{_motion(i, frames, w, h)}"
+                  f":d={frames}:s={w}x{h}:fps={REEL_FPS},fade=t=in:st=0:d=0.3:color={fades[i]},"
+                  f"fade=t=out:st={d - 0.3:.2f}:d=0.3,format=yuv420p")
+            clip = os.path.join(work, f"c{i}.mp4")
+            run([ff, "-y", "-loglevel", "error", "-i", f, "-vf", vf, "-frames:v", str(frames), "-an",
+                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26", "-maxrate", rate, "-bufsize", "2M",
+                 "-profile:v", "high", "-pix_fmt", "yuv420p",
+                 "-r", str(REEL_FPS), "-g", "60", "-threads", "1", "-filter_threads", "1", clip])
+            clips.append(clip)
+        lst = os.path.join(work, "list.txt")
+        with open(lst, "w") as fh:
+            fh.write("".join(f"file '{c}'\n" for c in clips))
+        run([ff, "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", lst, "-i", wav,
+             "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+             "-t", f"{total:.2f}", "-movflags", "+faststart", tmp_out])
+
+    try:
+        render(REEL_W, REEL_H)
+        if os.path.getsize(tmp_out) > REEL_MAX_BYTES:       # keep every video under 10 MB
+            os.remove(tmp_out)
+            render(720, 1280, "1000k")
+    except ReelError as e:
+        if "stopped" not in str(e):
+            raise
+        for f in os.listdir(work):                    # the server is small: try again at 720x1280 (still fine for Reels)
+            if f.startswith("c") and f.endswith(".mp4"):
+                os.remove(os.path.join(work, f))
+        render(720, 1280)
+
+
 def make_reel(p, take=0):
     """Build (or reuse) the Reel for a product. Returns the MP4 path."""
     import subprocess
@@ -5367,48 +5475,7 @@ def make_reel(p, take=0):
         wav = os.path.join(work, "music.wav")
         make_music(_music_style(tone), total, seed, wav)
 
-        def run(cmd):
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-            if r.returncode != 0:
-                why = (r.stderr or "").strip()[-250:]
-                if r.returncode < 0 or not why:
-                    why = f"the video tool was stopped (code {r.returncode}), most likely the server ran out of memory. " + why
-                raise ReelError("Video maker error: " + why)
-
-        def render(w, h, rate="1500k"):
-            """One small clip per picture (one ffmpeg at a time keeps memory low), joined without re-encoding."""
-            clips = []
-            for i, f in enumerate(files):
-                d = durs[i]
-                frames = int(round(d * REEL_FPS))
-                vf = (f"scale={int(w * 1.1)}:{int(h * 1.1)},{_motion(i, frames, w, h)}"
-                      f":d={frames}:s={w}x{h}:fps={REEL_FPS},fade=t=in:st=0:d=0.3:color={fades[i]},"
-                      f"fade=t=out:st={d - 0.3:.2f}:d=0.3,format=yuv420p")
-                clip = os.path.join(work, f"c{i}.mp4")
-                run([ff, "-y", "-loglevel", "error", "-i", f, "-vf", vf, "-frames:v", str(frames), "-an",
-                     "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26", "-maxrate", rate, "-bufsize", "2M",
-                     "-profile:v", "high", "-pix_fmt", "yuv420p",
-                     "-r", str(REEL_FPS), "-g", "60", "-threads", "1", "-filter_threads", "1", clip])
-                clips.append(clip)
-            lst = os.path.join(work, "list.txt")
-            with open(lst, "w") as fh:
-                fh.write("".join(f"file '{c}'\n" for c in clips))
-            run([ff, "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", lst, "-i", wav,
-                 "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
-                 "-t", f"{total:.2f}", "-movflags", "+faststart", tmp_out])
-
-        try:
-            render(REEL_W, REEL_H)
-            if os.path.getsize(tmp_out) > REEL_MAX_BYTES:       # keep every video under 10 MB
-                os.remove(tmp_out)
-                render(720, 1280, "1000k")
-        except ReelError as e:
-            if "stopped" not in str(e):
-                raise
-            for f in os.listdir(work):                    # the server is small: try again at 720x1280 (still fine for Reels)
-                if f.startswith("c") and f.endswith(".mp4"):
-                    os.remove(os.path.join(work, f))
-            render(720, 1280)
+        _encode_video(ff, work, files, durs, fades, wav, total, tmp_out)
         if not os.path.exists(tmp_out) or os.path.getsize(tmp_out) < 10000:
             raise ReelError("Video maker error: the video file was not created.")
         os.replace(tmp_out, out)
@@ -5612,3 +5679,288 @@ def admin_share_reel(pid):
 <button class="btn gold">📣 Post this Reel now</button>
 <a class="btn alt" href="{{ url_for('web.admin_share_reel', pid=p['id'], n=take+1) }}">🔄 Another take (new music)</a></form>""",
                       p=p, name=name, take=take, style=_music_style(tone_of(p)))
+
+
+# ================================================================== the general SHOP Reel (many products, in two parts)
+GEN_INTRO_S, GEN_OUTRO_S, GEN_PER_PRODUCT_S = 2.2, 3.0, 3.0
+
+
+def gen_per_part():
+    return max(4, min(9, to_int(setting("gen_per_part", "8"), 8) or 8))
+
+
+def auto_gen_on():
+    return setting("auto_gen_on", "0") == "1"
+
+
+def _hhmm(v, default):
+    m = re.fullmatch(r"\s*([01]?\d|2[0-3]):([0-5]\d)\s*", v or "")
+    return f"{int(m.group(1)):02d}:{m.group(2)}" if m else default
+
+
+def gen_times():
+    return {1: _hhmm(setting("auto_gen1_time", ""), "10:00"), 2: _hhmm(setting("auto_gen2_time", ""), "18:00")}
+
+
+def pick_general(n):
+    """n different products for one part, from a shuffled deck over the whole catalogue (no repeats until all were shown)."""
+    import random
+    elig = {r["id"]: r for r in _eligible()}
+    if not elig:
+        return []
+    try:
+        deck = [x for x in json.loads(setting("auto_deck_general", "[]")) if x in elig]
+    except ValueError:
+        deck = []
+    out = []
+    for _ in range(min(n, len(elig))):
+        if not deck or all(x in out for x in deck):
+            deck = [x for x in elig if x not in out]
+            random.shuffle(deck)
+        pid = next(x for x in deck if x not in out)
+        deck.remove(pid)
+        out.append(pid)
+    set_setting("auto_deck_general", json.dumps(deck))
+    return out
+
+
+def general_products(part, take=0):
+    """The products of one part for today. Stored, so the preview and the post show exactly the same ones."""
+    key = f"gen_set_{time.strftime('%Y-%m-%d')}_{part}_{take}"
+    try:
+        ids = json.loads(setting(key, "[]") or "[]")
+    except ValueError:
+        ids = []
+    elig = {r["id"]: r for r in _eligible()}
+    ids = [i for i in ids if i in elig]
+    if not ids:
+        ids = pick_general(gen_per_part())
+        set_setting(key, json.dumps(ids))
+        elig = {r["id"]: r for r in _eligible()}
+    return [elig[i] for i in ids if i in elig]
+
+
+def _scene_intro_part(part):
+    from PIL import ImageDraw
+    bg = _scene_intro()
+    d = ImageDraw.Draw(bg)
+    _pill(d, f"PART {part} OF 2", _font(56), REEL_W / 2, 300)
+    _centered(d, "Hijabs  •  Jilbabs  •  Textiles & more", _font(38, bold=False), 1440, (180, 180, 180))
+    return bg
+
+
+def _scene_outro_general(part, site_txt, wa):
+    from PIL import ImageDraw
+    bg = _gradient()
+    d = ImageDraw.Draw(bg)
+    lg = _reel_logo(380)
+    if lg:
+        d.ellipse((REEL_W / 2 - 212, 300, REEL_W / 2 + 212, 724), outline=REEL_GOLD, width=6)
+        bg.paste(lg, ((REEL_W - 380) // 2, 322), lg)
+    _centered(d, "ORDER NOW", _font(120), 820, REEL_GOLD)
+    f2 = _font(46, bold=False)
+    _centered(d, "Tap the link in our bio", f2, 990, (235, 235, 235))
+    if wa:
+        _centered(d, f"WhatsApp {wa}", f2, 1056, (235, 235, 235))
+    _pill(d, "Watch Part 2 next" if part == 1 else "Thank you for watching", _font(48), REEL_W / 2, 1220)
+    _centered(d, REEL_CLOSING, _font(40), 1700, REEL_GOLD)
+    _centered(d, REEL_PLACE, _font(32, bold=False), 1790, (170, 170, 170))
+    return bg
+
+
+def make_general_reel(part, take=0):
+    """Build the general Reel (Part 1 or 2): the shop intro, a few seconds for each product, then the order screen."""
+    ff = _ffmpeg()
+    if not ff:
+        raise ReelError("The video tool (FFmpeg) is not installed on the server.")
+    prods = general_products(part, take)
+    if not prods:
+        raise ReelError("There are no products in stock with a picture yet.")
+    wa = CFG.get("WHATSAPP", "")
+    items = []
+    with _share_tmp():
+        for p in prods:
+            ph = reel_items(p["id"])
+            pth = fetch_file(ph[0]["file_id"]) if ph else None
+            if pth:
+                items.append({"p": p, "path": pth, "fid": ph[0]["file_id"]})
+    if not items:
+        raise ReelError("None of the chosen products has a picture to show.")
+    sig = [(i["p"]["id"], _reel_text(i["p"]["name"]), repr(reel_prices(i["p"])), i["fid"]) for i in items]
+    key = hashlib.sha256("|".join([REEL_DESIGN, "general", str(part), str(take), repr(sig), setting("web_logo"), wa,
+                                    time.strftime("%Y-%m-%d")]).encode()).hexdigest()[:12]
+    out = os.path.join(_reel_dir(), f"general{part}_{key}.mp4")
+    if os.path.exists(out) and os.path.getsize(out) > 10000:
+        return out
+    each = min(GEN_PER_PRODUCT_S, (REEL_MAX_SECONDS - GEN_INTRO_S - GEN_OUTRO_S) / len(items))
+    work = os.path.join(_reel_dir(), f"tmp_{key}_{secrets.token_hex(3)}")
+    os.makedirs(work, exist_ok=True)
+    tmp_out = os.path.join(work, "out.mp4")
+    try:
+        import gc
+        files, durs, fades = [], [], []
+        site = site_base()
+
+        def add(im, d, fade):
+            f = os.path.join(work, f"s{len(files)}.png")
+            im.save(f)
+            im.close()
+            files.append(f)
+            durs.append(d)
+            fades.append(fade)
+        add(_scene_intro_part(part), GEN_INTRO_S, "black")
+        for n, it in enumerate(items):
+            p = it["p"]
+            src = _load(it["path"])
+            rows = reel_prices(p)
+            nums = list(fabric_prices(p["id"]).values()) or ([p["price"]] if p["price"] else [])
+            nm = _reel_text(p["name"]) or "New arrival"
+            im = _scene_hero(src, nm, rows, nums, "", True) if src.width / src.height < 0.72 else _scene_frame(src, nm, rows, nums, "", True)
+            src.close()
+            add(im, each, "0xD4A94A" if n % 2 == 1 else "black")
+            gc.collect()
+        add(_scene_outro_general(part, site, wa), GEN_OUTRO_S, "black")
+        total = sum(durs)
+        seed = int(hashlib.sha256(f"general-{part}-{take}-{time.strftime('%Y%m%d')}".encode()).hexdigest()[:8], 16)
+        wav = os.path.join(work, "music.wav")
+        make_music("intense", total, seed, wav)
+        _encode_video(ff, work, files, durs, fades, wav, total, tmp_out)
+        if not os.path.exists(tmp_out) or os.path.getsize(tmp_out) < 10000:
+            raise ReelError("Video maker error: the video file was not created.")
+        os.replace(tmp_out, out)
+    finally:
+        import shutil
+        shutil.rmtree(work, ignore_errors=True)
+    purge_reels(keep=out)
+    return out
+
+
+_GEN_OPEN = ["🔥 AD FASHION SHOP collection, Part {part} of 2!", "✨ Fresh picks from AD FASHION SHOP. Part {part} of 2!",
+             "💛 Look what is waiting for you at AD FASHION SHOP. Part {part} of 2!", "👑 Your next favourites are here. Part {part} of 2!",
+             "🌟 AD FASHION SHOP, Part {part} of 2. Watch till the end!", "🤍 Modesty, elegance, quality. Part {part} of 2!"]
+_GEN_CLOSE = ["Tap the link in our bio to order. 🚚", "Order today, delivery anywhere in Nigeria. 🚚", "Message us on WhatsApp to order. 💬",
+              "Which one is your favourite? 👇", "Save this and share with a friend. 💛", "Limited stock, so don't wait! 🏃🏽‍♀️"]
+
+
+def general_caption(part, names, n=0):
+    import random
+    rnd = random.Random(f"gen-{part}-{n}-{time.strftime('%Y%m%d')}")
+    shown = [x for x in names if x][:4]
+    mid = ("Featuring: " + ", ".join(shown) + ".") if shown else ""
+    tags = " ".join(rnd.sample(_REEL_REACH, 4)) + " #ADFashion #ADFashionHijabs #BauchiFashion"
+    return "\n".join(x for x in (rnd.choice(_GEN_OPEN).format(part=part), mid, rnd.choice(_GEN_CLOSE), tags) if x)
+
+
+def fresh_general_caption(part, names, plat):
+    label = "Facebook" if plat == "fb" else "Instagram"
+    used = used_captions(f"general{part}", label)
+    cap = ""
+    for n in range(200):
+        cap = general_caption(part, names, n)
+        if _norm(cap) not in used:
+            return cap
+    return cap + " " + time.strftime("%d%b")
+
+
+def do_general_reel(part, want, take=0, caps=None, auto=0):
+    """Make the general Reel and send it. Nothing is kept: the video is removed as soon as it has been sent."""
+    rdy, caps, out, info = social_ready(), caps or {}, [], {}
+    path = make_general_reel(part, take)
+    prods = general_products(part, take)
+    names = [p["name"] for p in prods]
+    cover_url, cover_bytes = _reel_cover(prods[0]["id"]) if prods else (None, None)
+    url = pub_vid_url(path)
+    pid = f"general{part}"
+    try:
+        for plat in ("fb", "ig"):
+            if plat not in want or not rdy[plat]:
+                continue
+            label = "Facebook" if plat == "fb" else "Instagram"
+            caption = (caps.get(plat) or "").strip()
+            if not caption or _norm(caption) in used_captions(pid, label):
+                caption = fresh_general_caption(part, names, plat)
+            try:
+                if plat == "fb":
+                    rid = post_facebook_reel(url, caption[:2100], info, cover_bytes)
+                else:
+                    rid = post_instagram_reel(url, caption[:2100], cover_url)
+                db().execute("INSERT INTO social_posts(product_id,platform,status,remote_id,caption,auto) VALUES(?,?,?,?,?,?)",
+                             (pid, label, "ok", str(rid), caption[:2100], auto))
+                out.append(f"✅ Posted Shop Reel Part {part} to {label}")
+            except Exception as e:
+                db().execute("INSERT INTO social_posts(product_id,platform,status,error,auto) VALUES(?,?,?,?,?)",
+                             (pid, label, "failed", ("Reel: " + str(e))[:300], auto))
+                out.append(f"❌ {label} Shop Reel failed: {e}")
+            db().commit()
+    finally:
+        _discard_video(path, delay=900 if info.get("late_fetch") else 0)
+    return out
+
+
+def run_general_auto(part, only=None):
+    """Automatic post of one part. Returns (a small product-like dict, messages)."""
+    rdy = social_ready()
+    want = [pl for pl in ("fb", "ig") if setting("auto_" + pl, "1") == "1" and rdy[pl] and (only is None or pl in only)]
+    me = {"id": f"general{part}", "name": f"Shop Reel Part {part}"}
+    if not want:
+        return me, ["❌ Auto-post: connect Facebook or Instagram first."]
+    if not site_base():
+        return me, ["❌ Auto-post: the app address is unknown. Set SITE_URL in Railway or open the Share page once."]
+    try:
+        msgs = do_general_reel(part, want, auto=1)
+    except Exception as e:
+        msgs = [f"❌ {me['name']}: {e}"]
+    try:
+        push_admins(("🤖 Auto-posted: " if any(m.startswith("✅") for m in msgs) else "⚠️ Auto-post failed: ") + me["name"],
+                    " · ".join(m for m in msgs if not m.startswith("ℹ️"))[:180], url="/admin/share", tag="autopost")
+    except Exception:
+        pass
+    return me, msgs
+
+
+@bp.route("/admin/share/general/<int:part>", methods=["GET", "POST"])
+@admin_required
+def admin_share_general(part):
+    if part not in (1, 2):
+        abort(404)
+    take = to_int(request.values.get("n"), 0) or 0
+    if request.method == "POST":
+        rdy = social_ready()
+        want = [pl for pl in ("fb", "ig") if setting("auto_" + pl, "1") == "1" and rdy[pl]]
+        if not want:
+            flash("Connect Facebook or Instagram first.")
+        elif queue_job("general", f"general{part}", want, take=take) is None:
+            flash("This Reel is already being sent. Please wait a moment.")
+        else:
+            flash("📤 Sending the Shop Reel in the background. You can leave the app. We will notify you when it is done.")
+        return redirect(url_for("web.admin_share"))
+    try:
+        path = make_general_reel(part, take)
+    except ReelError as e:
+        flash(f"Could not make the video: {e}")
+        return redirect(url_for("web.admin_share"))
+    names = [p["name"] for p in general_products(part, take)]
+    return admin_page("Shop Reel preview", """<p><a href="{{ url_for('web.admin_share') }}">‹ Share</a></p>
+<h2>🎬 Shop Reel · Part {{ part }} of 2</h2>
+<video src="{{ url_for('web.admin_reelfile', name=name) }}" controls playsinline preload="metadata" style="width:100%;max-width:340px;border-radius:14px;background:#000"></video>
+<p class="mut small">{{ names|length }} products: {{ names|join(', ') }}. This is exactly what will be posted, with the intense music.</p>
+<form method="post" class="row" style="margin-top:10px"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="n" value="{{ take }}">
+<button class="btn gold">📣 Post Part {{ part }} now</button>
+<a class="btn alt" href="{{ url_for('web.admin_share_general', part=part, n=take+1) }}">🔄 Choose other products</a></form>""",
+                      part=part, name=os.path.basename(path), names=names, take=take)
+
+
+@bp.post("/admin/share/general/auto")
+@admin_required
+def admin_share_general_auto():
+    was_on = auto_gen_on()
+    set_setting("auto_gen_on", "1" if request.form.get("gen_on") else "0")
+    set_setting("auto_gen1_time", _hhmm(request.form.get("t1"), gen_times()[1]))
+    set_setting("auto_gen2_time", _hhmm(request.form.get("t2"), gen_times()[2]))
+    set_setting("gen_per_part", str(max(4, min(9, to_int(request.form.get("per"), 8) or 8))))
+    if not was_on and auto_gen_on():                         # switching on: do not fire a slot that has just passed
+        for kind, s in _due_slots(datetime.now(LAGOS)):
+            set_setting("auto_done_" + _slot_key(kind, s), "1")
+    t = gen_times()
+    flash(f"Saved. Shop Reel: {'on, Part 1 at ' + t[1] + ' and Part 2 at ' + t[2] + ' (Nigeria time)' if auto_gen_on() else 'off. Post it by hand whenever you like.'}")
+    return redirect(url_for("web.admin_share"))
