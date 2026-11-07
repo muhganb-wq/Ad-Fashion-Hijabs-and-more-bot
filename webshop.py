@@ -203,6 +203,7 @@ def init_web_db():
     addcol("orders", "web_user_id", "INTEGER")
     addcol("products", "sold_out", "INTEGER DEFAULT 0")
     addcol("product_photos", "sold_out", "INTEGER DEFAULT 0")
+    addcol("product_photos", "orig_file_id", "TEXT")
     addcol("products", "restocked_at", "TEXT")
     addcol("orders", "received_confirmed", "INTEGER DEFAULT 0")
     addcol("social_posts", "caption", "TEXT DEFAULT ''")
@@ -417,9 +418,12 @@ NEW_DAYS = 30
 
 
 def new_arrivals(limit=None):
-    """Products uploaded in the last 30 days, newest first."""
-    sql = ("SELECT *, 1 AS is_new FROM products WHERE active=1 AND added_at IS NOT NULL "
-           f"AND added_at >= datetime('now','-{NEW_DAYS} days') ORDER BY added_at DESC, rowid DESC")
+    """Products uploaded in the last 30 days, plus products put back in stock in the last 7 days
+    (those show the BACK IN STOCK tag instead of NEW). Newest activity first."""
+    sql = ("SELECT *, 1 AS is_new FROM products WHERE active=1 AND ("
+           f"(added_at IS NOT NULL AND added_at >= datetime('now','-{NEW_DAYS} days')) "
+           "OR (COALESCE(sold_out,0)=0 AND restocked_at IS NOT NULL AND restocked_at >= datetime('now','-7 days'))) "
+           "ORDER BY MAX(COALESCE(added_at,''), COALESCE(restocked_at,'')) DESC, rowid DESC")
     return db().execute(sql + (f" LIMIT {int(limit)}" if limit else "")).fetchall()
 
 
@@ -437,12 +441,12 @@ def products(category=None, q=None, sub=None):
 
 def product_photos(pid):
     rows = db().execute(
-        "SELECT id,file_id,label,COALESCE(sold_out,0) AS so FROM product_photos WHERE product_id=? ORDER BY position,id", (pid,)).fetchall()
-    out = [{"id": r["id"], "file_id": r["file_id"], "label": r["label"] or "", "sold_out": r["so"]} for r in rows]
+        "SELECT id,file_id,label,COALESCE(sold_out,0) AS so,COALESCE(orig_file_id,'') AS orig FROM product_photos WHERE product_id=? ORDER BY position,id", (pid,)).fetchall()
+    out = [{"id": r["id"], "file_id": r["file_id"], "label": r["label"] or "", "sold_out": r["so"], "orig": r["orig"]} for r in rows]
     if not out:
         r = db().execute("SELECT photo_file_id FROM products WHERE id=?", (pid,)).fetchone()
         if r and r["photo_file_id"]:
-            out = [{"id": 0, "file_id": r["photo_file_id"], "label": "", "sold_out": 0}]
+            out = [{"id": 0, "file_id": r["photo_file_id"], "label": "", "sold_out": 0, "orig": ""}]
     return out
 
 
@@ -2811,6 +2815,7 @@ def admin_product(pid):
 <div class="grid">{% for ph in photos %}<div class="card"><img src="{{ url_for('web.img', fid=ph.file_id) }}" style="width:100%;aspect-ratio:1;object-fit:cover;display:block" alt="">
 <div class="b" style="padding:8px"><div class="small">{{ ph.label or 'no label' }}{% if loop.first %} · cover{% endif %}{% if ph.sold_out %} <span class="tag bad">Sold out</span>{% endif %}</div>
 {% if ph.id %}<form method="post" action="{{ url_for('web.admin_photo_soldout', phid=ph.id) }}" style="margin-top:6px"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="pid" value="{{ p['id'] }}"><button class="btn {{ 'gold' if ph.sold_out else 'alt' }} sm block">{{ '✅ Restock this colour' if ph.sold_out else '🚫 Mark sold out' }}</button></form>{% endif %}
+{% if ph.id %}<div class="row" style="margin-top:6px"><a class="btn alt sm" href="{{ url_for('web.admin_photo_blur', phid=ph.id) }}">🙈 Blur face</a>{% if ph.orig %}<form method="post" action="{{ url_for('web.admin_photo_unblur', phid=ph.id) }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn alt sm">Restore original</button></form>{% endif %}</div>{% endif %}
 {% if ph.id %}<div class="row" style="margin-top:6px">{% if not loop.first %}<form method="post" action="{{ url_for('web.admin_photo_cover', phid=ph.id) }}"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="pid" value="{{ p['id'] }}"><button class="btn alt sm">Make cover</button></form>{% endif %}
 <form method="post" action="{{ url_for('web.admin_photo_delete', phid=ph.id) }}" onsubmit="return confirm('Delete this photo?')"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="pid" value="{{ p['id'] }}"><button class="btn alt sm" style="color:var(--bad)">{{ icon('trash') }}</button></form></div>{% endif %}</div></div>{% endfor %}</div>
 <form method="post" action="{{ url_for('web.admin_product_delete', pid=p['id']) }}" onsubmit="return confirm('Hide this product from the shop?')" style="margin-top:20px"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn bad block">Hide product from shop</button></form>{% endif %}
@@ -2843,6 +2848,116 @@ def admin_photo_cover(phid):
     sync_cover(pid)
     db().commit()
     return redirect(url_for("web.admin_product", pid=pid))
+
+
+def blur_regions(blob, regions):
+    """Blur the chosen ellipses (fractions of the picture: x0,y0,x1,y1) so faces cannot be recognised. Returns JPEG bytes."""
+    from PIL import Image, ImageOps, ImageFilter, ImageDraw
+    im = ImageOps.exif_transpose(Image.open(io.BytesIO(blob))).convert("RGB")
+    if max(im.size) > 2560:
+        im.thumbnail((2560, 2560))
+    W, H = im.size
+    for r in regions[:12]:
+        try:
+            x0, y0, x1, y1 = [min(1.0, max(0.0, float(v))) for v in r]
+        except (TypeError, ValueError):
+            continue
+        if x1 < x0: x0, x1 = x1, x0
+        if y1 < y0: y0, y1 = y1, y0
+        w, h = (x1 - x0) * W, (y1 - y0) * H
+        if w < 8 or h < 8:
+            continue
+        padx, pady = w * 0.12, h * 0.12                       # a little extra so hair line and chin are covered too
+        bx0, by0 = max(0, int(x0 * W - padx)), max(0, int(y0 * H - pady))
+        bx1, by1 = min(W, int(x1 * W + padx)), min(H, int(y1 * H + pady))
+        box = im.crop((bx0, by0, bx1, by1))
+        bw, bh = box.size
+        small = box.resize((max(2, bw // 14), max(2, bh // 14)), Image.BILINEAR).resize((bw, bh), Image.BILINEAR)
+        soft = small.filter(ImageFilter.GaussianBlur(max(6, min(bw, bh) // 9)))
+        mask = Image.new("L", (bw, bh), 0)
+        ImageDraw.Draw(mask).ellipse([0, 0, bw - 1, bh - 1], fill=255)
+        mask = mask.filter(ImageFilter.GaussianBlur(max(2, min(bw, bh) // 28)))
+        im.paste(soft, (bx0, by0), mask)
+    out = io.BytesIO()
+    im.save(out, "JPEG", quality=92)
+    return out.getvalue()
+
+
+@bp.route("/admin/photo/<int:phid>/blur", methods=["GET", "POST"])
+@admin_required
+def admin_photo_blur(phid):
+    ph = db().execute("SELECT * FROM product_photos WHERE id=?", (phid,)).fetchone()
+    if not ph:
+        abort(404)
+    pid = ph["product_id"]
+    if request.method == "POST":
+        try:
+            regions = json.loads(request.form.get("regions", "[]"))
+            assert isinstance(regions, list) and regions
+        except Exception:
+            flash("Draw a circle over each face first.")
+            return redirect(url_for("web.admin_photo_blur", phid=phid))
+        path = fetch_file(ph["file_id"])
+        if not path:
+            flash("Could not load the picture. Try again.")
+            return redirect(url_for("web.admin_photo_blur", phid=phid))
+        with open(path, "rb") as f:
+            blob = f.read()
+        try:
+            new = blur_regions(blob, regions)
+        except Exception:
+            flash("This picture could not be edited.")
+            return redirect(url_for("web.admin_product", pid=pid))
+        nfid = tg_upload_photo(new, "🙈 Face blurred")
+        if not nfid:
+            flash("Could not save the blurred picture. Try again.")
+            return redirect(url_for("web.admin_photo_blur", phid=phid))
+        d = db()
+        d.execute("UPDATE product_photos SET file_id=?, orig_file_id=COALESCE(orig_file_id, ?) WHERE id=?", (nfid, ph["file_id"], phid))
+        d.execute("UPDATE color_options SET photo_file_id=? WHERE photo_file_id=?", (nfid, ph["file_id"]))
+        sync_cover(pid)
+        d.commit()
+        flash("Face blurred and saved. You can restore the original from the gallery.")
+        return redirect(url_for("web.admin_product", pid=pid))
+    return admin_page("Blur face", """
+<a href="{{ url_for('web.admin_product', pid=pid) }}" class="small mut">← Back to product</a>
+<h2>🙈 Blur a face</h2>
+<p class="mut small" style="margin-top:0">Drag with your finger over each face to draw a circle around it. Draw one for every face, then tap Blur.</p>
+<div id="stage" style="position:relative;touch-action:none;user-select:none;-webkit-user-select:none;border-radius:12px;overflow:hidden;line-height:0">
+<img id="pic" src="{{ url_for('web.img', fid=fid) }}" alt="" style="width:100%;display:block;-webkit-user-drag:none"><canvas id="cv" style="position:absolute;left:0;top:0;width:100%;height:100%"></canvas></div>
+<form method="post" id="bf" style="margin-top:12px"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="regions" id="regions">
+<div class="row"><button type="button" class="btn alt sm" id="undo">↩ Undo</button><button type="button" class="btn alt sm" id="clr">Clear</button><span class="small mut" id="cnt">0 faces marked</span></div>
+<button class="btn gold block" style="margin-top:10px" id="go">Blur the marked faces</button></form>
+<script>
+(function(){var im=document.getElementById('pic'),cv=document.getElementById('cv'),cx=cv.getContext('2d'),R=[],cur=null;
+function fit(){cv.width=im.clientWidth;cv.height=im.clientHeight;draw()}
+function draw(){cx.clearRect(0,0,cv.width,cv.height);R.concat(cur?[cur]:[]).forEach(function(r){var x0=Math.min(r[0],r[2])*cv.width,y0=Math.min(r[1],r[3])*cv.height,x1=Math.max(r[0],r[2])*cv.width,y1=Math.max(r[1],r[3])*cv.height;
+cx.beginPath();cx.ellipse((x0+x1)/2,(y0+y1)/2,Math.max(1,(x1-x0)/2),Math.max(1,(y1-y0)/2),0,0,6.2832);cx.fillStyle='rgba(214,168,64,.28)';cx.fill();cx.lineWidth=3;cx.strokeStyle='#d6a840';cx.stroke()});
+document.getElementById('cnt').textContent=R.length+' face'+(R.length==1?'':'s')+' marked'}
+function pt(e){var b=cv.getBoundingClientRect();return [Math.min(1,Math.max(0,(e.clientX-b.left)/b.width)),Math.min(1,Math.max(0,(e.clientY-b.top)/b.height))]}
+cv.addEventListener('pointerdown',function(e){e.preventDefault();cv.setPointerCapture(e.pointerId);var p=pt(e);cur=[p[0],p[1],p[0],p[1]]});
+cv.addEventListener('pointermove',function(e){if(!cur)return;var p=pt(e);cur[2]=p[0];cur[3]=p[1];draw()});
+function end(){if(cur){if(Math.abs(cur[2]-cur[0])>.02&&Math.abs(cur[3]-cur[1])>.02)R.push(cur);cur=null;draw()}}
+cv.addEventListener('pointerup',end);cv.addEventListener('pointercancel',end);
+document.getElementById('undo').onclick=function(){R.pop();draw()};document.getElementById('clr').onclick=function(){R=[];draw()};
+document.getElementById('bf').addEventListener('submit',function(e){if(!R.length){e.preventDefault();alert('Draw a circle over each face first.');return}document.getElementById('regions').value=JSON.stringify(R);document.getElementById('go').disabled=true;document.getElementById('go').textContent='Blurring…'});
+if(im.complete)fit();im.addEventListener('load',fit);window.addEventListener('resize',fit)})();
+</script>""", pid=pid, fid=ph["file_id"])
+
+
+@bp.post("/admin/photo/<int:phid>/unblur")
+@admin_required
+def admin_photo_unblur(phid):
+    ph = db().execute("SELECT * FROM product_photos WHERE id=?", (phid,)).fetchone()
+    if not ph or not ph["orig_file_id"]:
+        abort(404)
+    d = db()
+    d.execute("UPDATE color_options SET photo_file_id=? WHERE photo_file_id=?", (ph["orig_file_id"], ph["file_id"]))
+    d.execute("UPDATE product_photos SET file_id=?, orig_file_id=NULL WHERE id=?", (ph["orig_file_id"], phid))
+    sync_cover(ph["product_id"])
+    d.commit()
+    flash("Original picture restored.")
+    return redirect(url_for("web.admin_product", pid=ph["product_id"]))
 
 
 @bp.post("/admin/photo/<int:phid>/soldout")
@@ -3348,14 +3463,44 @@ def _brand_logo_small():
             if lg is not None:
                 side = min(lg.size)
                 w, h = lg.size
-                em = lg.convert("RGB").crop(((w - side) // 2, (h - side) // 2, (w + side) // 2, (h + side) // 2)).resize((104, 104), Image.LANCZOS)
-                m = Image.new("L", (416, 416), 0)
-                ImageDraw.Draw(m).ellipse([0, 0, 415, 415], fill=255)
-                em.putalpha(m.resize((104, 104), Image.LANCZOS))
+                sq = lg.convert("RGB").crop(((w - side) // 2, (h - side) // 2, (w + side) // 2, (h + side) // 2)).resize((320, 320), Image.LANCZOS)
+                m = Image.new("L", (1280, 1280), 0)
+                ImageDraw.Draw(m).ellipse([0, 0, 1279, 1279], fill=255)
+                sq.putalpha(m.resize((320, 320), Image.LANCZOS))
+                _BRAND_LOGO["big"] = sq
+                em = sq.resize((104, 104), Image.LANCZOS)
         except Exception:
             em = None
         _BRAND_LOGO.update(key=key, img=em)
     return _BRAND_LOGO.get("img")
+
+
+def place_round_logo(im, big, calm=30):
+    """Put the round logo in the calmest corner of the picture, only if that corner is plain enough
+    (a wall, a studio background). A busy picture is left alone, so the logo never hides the product."""
+    from PIL import Image, ImageDraw, ImageStat
+    if big is None:
+        return im
+    im = im.convert("RGB")
+    W, H = im.size
+    d = max(70, int(min(W, H) * 0.17))
+    mg = max(12, int(min(W, H) * 0.035))
+    spots = {"tl": (mg, mg), "tr": (W - mg - d, mg), "bl": (mg, H - mg - d), "br": (W - mg - d, H - mg - d)}
+    best, score = None, 1e9
+    for k, (x, y) in spots.items():
+        reg = im.crop((x - mg // 2, y - mg // 2, x + d + mg // 2, y + d + mg // 2)).convert("L")
+        sd = ImageStat.Stat(reg).stddev[0]
+        if sd < score:
+            best, score = (x, y), sd
+    if best is None or score > calm:
+        return im
+    out = im.copy()
+    lg = big.resize((d, d), Image.LANCZOS)
+    ring = Image.new("RGBA", (d + 8, d + 8), (0, 0, 0, 0))
+    ImageDraw.Draw(ring).ellipse([0, 0, d + 7, d + 7], fill=(214, 168, 64, 255))
+    out.paste(ring, (best[0] - 4, best[1] - 4), ring)
+    out.paste(lg.convert("RGB"), best, lg.split()[-1])
+    return out
 
 
 def brand_frame(im, emblem):
@@ -3363,7 +3508,7 @@ def brand_frame(im, emblem):
     so the logo never covers the product and nothing is cropped."""
     from PIL import Image, ImageDraw
     W, H, S = 1080, 1350, 130
-    im = im.convert("RGB")
+    im = place_round_logo(im.convert("RGB"), _BRAND_LOGO.get("big"))
     area = H - S
     sc = min(W / im.width, area / im.height)
     pic = im.resize((max(1, int(im.width * sc)), max(1, int(im.height * sc))), Image.LANCZOS)
