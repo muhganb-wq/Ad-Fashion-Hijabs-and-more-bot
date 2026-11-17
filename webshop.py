@@ -117,7 +117,7 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 PHONE_EXEMPT = {"web.complete_profile", "web.logout", "web.icon_maskable", "web.push_key", "web.admin_lock_route"}
 PUBLIC_ENDPOINTS = {
     "web.home", "web.login", "web.register_page", "web.manifest", "web.service_worker",
-    "web.google_auth", "web.pubimg", "web.pubvid", "web.qr_png", "web.qr_card", "web.icon", "web.brand_logo", "web.brand_flyer", "web.health", "web.robots",
+    "web.google_auth", "web.pubimg", "web.pubvid", "web.pubpkg", "web.qr_png", "web.qr_card", "web.icon", "web.brand_logo", "web.brand_flyer", "web.health", "web.robots",
 }
 _login_attempts = {}
 
@@ -508,6 +508,13 @@ def cart():
 def cart_detail():
     items, total = [], 0
     for key, qty in list(cart().items()):
+        if str(key).startswith("pk|"):                     # a package: one cart line made of several products
+            line = pkg_cart_line(key, qty)
+            if not line:
+                cart().pop(key, None); continue
+            total += line["line"]
+            items.append(line)
+            continue
         pid, cid, fab = parse_key(key)
         p = db().execute("SELECT * FROM products WHERE id=? AND active=1", (pid,)).fetchone()
         if not p:
@@ -1666,12 +1673,14 @@ def home():
         r = d.execute("SELECT photo_file_id FROM products WHERE category=? AND active=1 AND photo_file_id!='' LIMIT 1", (k,)).fetchone()
         tiles.append({"key": k, "label": label, "img": r["photo_file_id"] if r else ""})
     latest = d.execute("SELECT * FROM news_posts ORDER BY pinned DESC, id DESC LIMIT 2").fetchall()
-    return page("Home", """
+    return page("Home", PKG_CARD + """
 {% if pct %}<div class="promo">🎉 {{ pct }}% OFF everything — applied automatically at checkout!</div>{% endif %}
 <h2>Assalamu alaikum, {{ user['name'].split()[0] }} 👋</h2><p class="mut" style="margin-top:0">What would you like to wear today?</p>
 {% if flyer %}<img class="flyer" src="/brand/flyer" alt="" onerror="this.remove()">{% endif %}
 <div class="grid" style="grid-template-columns:repeat(2,1fr)">{% for t in tiles %}<a class="tile" href="{{ url_for('web.shop', c=t.key) }}">
 {% if t.img %}<img src="{{ url_for('web.img', fid=t.img) }}" alt="">{% endif %}<span>{{ t.label }}</span></a>{% endfor %}</div>
+{% if pkgs %}<div class="sec"><h3>📦 Packages</h3><a href="{{ url_for('web.packages_page') }}">See all</a></div>
+<div class="hscroll">{% for k in pkgs %}{{ kcard(k) }}{% endfor %}</div>{% endif %}
 {% if new %}<div class="sec"><h3>New arrivals</h3><a href="{{ url_for('web.new_arrivals_page') }}">See all</a></div>
 <div class="hscroll">{% for p in new %}{{ pcard(p) }}{% endfor %}</div>{% endif %}
 {% if latest %}<div class="sec"><h3>Latest news</h3><a href="{{ url_for('web.news') }}">All news</a></div>
@@ -1679,7 +1688,7 @@ def home():
 <span class="tag {{ 'g' if n['kind']=='giveaway' }}">{{ n['kind']|title }}</span><h3>{{ n['title'] }}</h3>
 <p class="mut small" style="margin:.2em 0">{{ n['body'][:110] }}{% if n['body']|length>110 %}…{% endif %}</p></a>{% endfor %}{% endif %}
 <p><a class="btn wa block" href="https://wa.me/{{ cfg.WHATSAPP }}">{{ icon('chat') }} Chat with us on WhatsApp</a></p>
-""", tab="home", pct=discount_pct(), tiles=tiles, new=new, latest=latest, flyer=bool(setting("web_flyer")))
+""", tab="home", pct=discount_pct(), tiles=tiles, new=new, pkgs=pkg_cards()[:8], latest=latest, flyer=bool(setting("web_flyer")))
 
 
 def _announce_signup(name, email, phone=""):
@@ -1804,7 +1813,7 @@ def shop():
     items = products(c if c in cats() else None, q or None, sub)
     return page("Shop", """
 <form method="get" class="row" style="flex-wrap:nowrap"><input name="q" value="{{ q }}" placeholder="Search hijabs, jilbabs, fabrics…" style="flex:1"><button class="btn sm">Search</button></form>
-<div class="pills" style="margin-top:12px"><a class="pill {{ 'on' if not c }}" href="{{ url_for('web.shop') }}">All</a>
+<div class="pills" style="margin-top:12px"><a class="pill {{ 'on' if not c }}" href="{{ url_for('web.shop') }}">All</a><a class="pill" href="{{ url_for('web.packages_page') }}">📦 Packages</a>
 {% for k,v in cats.items() %}<a class="pill {{ 'on' if c==k }}" href="{{ url_for('web.shop', c=k) }}">{{ v }}</a>{% endfor %}</div>
 {% if subs %}<div class="pills">{% for k,lab in subs %}<a class="pill {{ 'on' if sub==k }}" href="{{ url_for('web.shop', c=c, s=k) }}">{{ clean(lab) }}</a>{% endfor %}</div>{% endif %}
 {% if not items %}<p class="mut">Nothing found.</p>{% endif %}
@@ -2090,7 +2099,14 @@ def cart_view():
     return page("Cart", """
 <h2>Your cart</h2>{% if not items %}<div class="card" style="padding:30px;text-align:center"><p class="mut">Your cart is empty.</p>
 <a class="btn gold" href="{{ url_for('web.shop') }}">Start shopping</a></div>{% else %}
-{% for i in items %}<div class="card li" style="margin-bottom:10px">
+{% for i in items %}{% if i.pkg %}<div class="card li" style="margin-bottom:10px"><img class="th" src="{{ url_for('web.package_cover', pid=i.pkg['id']) }}" alt="">
+<div class="grow"><b>📦 {{ i.pkg['name'] }}</b>
+{% for s in i.subs %}<div class="small mut">• {{ s.p['name'] }}{% if s.fab_name %} · {{ s.fab_name }}{% endif %}{% if s.qty!=1 %} × {{ fq(s.qty) }}{{ ' '~s.unit~'s' if s.unit }}{% endif %}{% if s.color %} · <img src="{{ url_for('web.img', fid=s.color['photo_file_id']) }}" style="width:16px;height:16px;border-radius:5px;object-fit:cover;vertical-align:middle"> #{{ s.color['id'] }}{% endif %}{% if s.gone %} <b style="color:#b3261e">sold out</b>{% endif %}</div>{% endfor %}
+<div class="price">{{ money(i.line) }}</div>{% if i.qty>1 %}<div class="small mut">{{ i.qty }} × {{ money(i.one) }}</div>{% endif %}
+<form method="post" action="{{ url_for('web.cart_update') }}" class="row" style="margin-top:6px;gap:6px"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="key" value="{{ i.key }}">
+<div class="qty"><button name="qty" value="{{ i.qty-1 }}" style="width:36px;height:36px">−</button><input value="{{ i.qty }}" readonly style="width:48px"><button name="qty" value="{{ i.qty+1 }}" style="width:36px;height:36px">+</button></div>
+<button name="qty" value="0" class="btn alt sm" style="padding:6px 10px" aria-label="Remove">{{ icon('trash') }}</button></form></div></div>
+{% else %}<div class="card li" style="margin-bottom:10px">
 {% if i.p['photo_file_id'] %}<img class="th" src="{{ url_for('web.img', fid=i.p['photo_file_id']) }}" alt="">{% endif %}
 <div class="grow"><b>{{ i.p['name'] }}</b>
 {% if i.fab_name %}<div class="small"><span class="tag">{{ i.fab_name }}</span></div>{% endif %}
@@ -2099,7 +2115,7 @@ def cart_view():
 {% if i.unit %}<div class="small mut">{{ fq(i.qty) }} {{ i.unit }}{{ '' if i.qty==1 else 's' }} × {{ money(i.price) }}</div>{% endif %}
 <form method="post" action="{{ url_for('web.cart_update') }}" class="row" style="margin-top:6px;gap:6px"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="key" value="{{ i.key }}">
 <div class="qty"><button name="qty" value="{{ fq(i.qty-i.step) }}" style="width:36px;height:36px">−</button><input value="{{ fq(i.qty) }}" readonly style="width:48px"><button name="qty" value="{{ fq(i.qty+i.step) }}" style="width:36px;height:36px">+</button></div>
-<button name="qty" value="0" class="btn alt sm" style="padding:6px 10px" aria-label="Remove">{{ icon('trash') }}</button></form></div></div>{% endfor %}
+<button name="qty" value="0" class="btn alt sm" style="padding:6px 10px" aria-label="Remove">{{ icon('trash') }}</button></form></div></div>{% endif %}{% endfor %}
 <div class="card" style="padding:16px">
 {% if off %}<div class="row between mut"><span>Subtotal</span><span>{{ money(total) }}</span></div>
 <div class="row between" style="color:var(--ok);font-weight:700"><span>{{ pct }}% store discount</span><span>-{{ money(off) }}</span></div>{% endif %}
@@ -2119,7 +2135,10 @@ def checkout():
     if setting("accepting_orders", "1") == "0":
         flash("We are not accepting new orders right now. Please check back soon.")
         return redirect(url_for("web.cart_view"))
-    gone = [i["p"]["name"] for i in items if i["p"]["sold_out"]]
+    gone = [i["p"]["name"] for i in items if i.get("pkg") is None and i["p"]["sold_out"]]
+    for i in items:
+        if i.get("pkg"):
+            gone += [s["p"]["name"] + " (in " + i["pkg"]["name"] + ")" for s in i["subs"] if s["gone"]]
     if gone:
         flash("Sold out meanwhile: " + ", ".join(gone) + ". Please remove it from your cart to continue.")
         return redirect(url_for("web.cart_view"))
@@ -2137,6 +2156,12 @@ def checkout():
             return redirect(url_for("web.checkout"))
         lines = []
         for i in items:
+            if i.get("pkg"):
+                lines.append(f"📦 {i['pkg']['name']} x{i['qty']} - {money(i['line'])}")
+                for s in i["subs"]:
+                    ex = (f" ({s['fab_name']})" if s["fab_name"] else "") + (f" [Colour #{s['color']['id']}]" if s["color"] else "")
+                    lines.append(f"   • {s['p']['name']}{ex} x{fmt_qty(s['qty_all'])}{(' ' + s['unit'] + ('s' if s['qty_all'] != 1 else '')) if s['unit'] else ''} - {money(s['line_all'])}")
+                continue
             extra = (f" ({i['fab_name']})" if i["fab_name"] else "") + (f" [Colour #{i['color']['id']}]" if i["color"] else "")
             lines.append(f"{i['p']['name']}{extra} x{fmt_qty(i['qty'])}{(' ' + i['unit'] + 's') if i['unit'] and i['qty'] != 1 else (' ' + i['unit'] if i['unit'] else '')} - {money(i['line'])}")
         off, fee, grand = pricing(total, method)
@@ -2150,11 +2175,18 @@ def checkout():
                delivery_method,city,state,delivery_notes,product_ids,web_user_id)
                VALUES(0,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             ("web:" + u["email"], u["name"], phone, addr or CFG["ADDRESS"], "\n".join(lines), grand,
-             "AWAITING_PAYMENT", method, city, state, notes, ",".join(i["key"] for i in items), u["id"]))
+             "AWAITING_PAYMENT", method, city, state, notes, ",".join(",".join(make_key(s["p"]["id"], s["color"]["id"] if s["color"] else None, s["fab"]) for s in i["subs"]) if i.get("pkg") else i["key"] for i in items), u["id"]))
         oid = cur.lastrowid
         if method == "pickup":
             d.execute("UPDATE orders SET pickup_time=? WHERE id=?", (re.sub(r"\s+", " ", request.form.get("pickup_time", "")).strip()[:60], oid))
         for i in items:
+            if i.get("pkg"):
+                for s in i["subs"]:
+                    d.execute("""INSERT INTO order_items(order_id,product_id,product_name,quantity,unit_price,color_id,color_photo_file_id,fabric)
+                                 VALUES(?,?,?,?,?,?,?,?)""",
+                              (oid, s["p"]["id"], f"{s['p']['name']} [Package: {i['pkg']['name']}]", s["qty_all"], s["price"],
+                               s["color"]["id"] if s["color"] else None, s["color"]["photo_file_id"] if s["color"] else "", s["fab"] or ""))
+                continue
             d.execute("""INSERT INTO order_items(order_id,product_id,product_name,quantity,unit_price,color_id,color_photo_file_id,fabric)
                          VALUES(?,?,?,?,?,?,?,?)""",
                       (oid, i["p"]["id"], i["p"]["name"], i["qty"], i["price"],
@@ -2521,7 +2553,7 @@ def news_comment_delete(cid):
 
 # ================================================================== ADMIN (manage everything inside the app)
 ADMIN_NAV = """<div class="pills" style="margin-bottom:6px">
-{% for ep,label in [('web.admin_home','Dashboard'),('web.admin_orders','Orders'),('web.admin_products','Products'),('web.admin_categories','Categories'),('web.admin_colors','Colours'),('web.admin_news','News'),('web.admin_settings','Settings'),('web.admin_customers','Customers'),('web.admin_share','📣 Share'),('web.qr_page','📲 QR'),('web.admin_thanks','💛 Thank you'),('web.admin_pin_change','🔐 PIN')] %}
+{% for ep,label in [('web.admin_home','Dashboard'),('web.admin_orders','Orders'),('web.admin_products','Products'),('web.admin_packages','📦 Packages'),('web.admin_categories','Categories'),('web.admin_colors','Colours'),('web.admin_news','News'),('web.admin_settings','Settings'),('web.admin_customers','Customers'),('web.admin_share','📣 Share'),('web.qr_page','📲 QR'),('web.admin_thanks','💛 Thank you'),('web.admin_pin_change','🔐 PIN')] %}
 <a class="pill {{ 'on' if request.endpoint==ep }}" href="{{ url_for(ep) }}">{{ label }}</a>{% endfor %}</div>"""
 
 
@@ -4021,7 +4053,11 @@ def run_job(flask_app, jid):
             want, picked, caps = json.loads(j["want"]), json.loads(j["picked"]), json.loads(j["caps"])
             p = db().execute("SELECT * FROM products WHERE id=?", (j["product_id"],)).fetchone() if j["product_id"] else None
             pushed = False
-            if j["kind"] == "general":
+            if j["kind"] == "package":
+                pk = db().execute("SELECT * FROM packages WHERE id=?", ((j["product_id"] or "")[4:],)).fetchone()
+                p = {"id": j["product_id"], "name": pk["name"] if pk else "Package"}
+                msgs = do_share_package(pk, want, caps) if pk else ["❌ That package no longer exists."]
+            elif j["kind"] == "general":
                 p = {"id": "general", "name": "Shop Reel"}
                 msgs = do_general_reel(want, caps=caps)
             elif j["kind"] == "next":
@@ -4068,6 +4104,11 @@ def admin_share_pulse():
     return {"sig": _job_sig()}
 
 
+def pkname(pid):
+    r = db().execute("SELECT name FROM packages WHERE id=?", ((pid or "")[4:],)).fetchone()
+    return r["name"] if r else "Package"
+
+
 def recent_jobs(limit=5):
     rows = db().execute("""SELECT j.*, p.name FROM share_jobs j LEFT JOIN products p ON p.id=j.product_id
                            WHERE j.created_at>=datetime('now','-1 day') ORDER BY j.id DESC LIMIT ?""", (limit,)).fetchall()
@@ -4077,7 +4118,7 @@ def recent_jobs(limit=5):
             msgs = json.loads(r["result"] or "[]")
         except ValueError:
             msgs = []
-        out.append({"id": r["id"], "name": r["name"] or ("Shop Reel" if (r["product_id"] or "").startswith("general") else "Next product"), "kind": r["kind"], "status": r["status"],
+        out.append({"id": r["id"], "name": r["name"] or (("📦 " + (pkname(r["product_id"]))) if (r["product_id"] or "").startswith("pkg:") else "Shop Reel" if (r["product_id"] or "").startswith("general") else "Next product"), "kind": r["kind"], "status": r["status"],
                     "msgs": msgs, "at": (r["finished_at"] or r["created_at"] or "")[11:16]})
     return out
 
@@ -4436,6 +4477,9 @@ def admin_share():
 {% for m in j['msgs'] %}<div class="mut">{{ m }}</div>{% endfor %}</div>{% endfor %}</div>
 {% if busy %}<script>setTimeout(function(){location.reload()},4000);</script>{% endif %}{% endif %}
 <script>(function(){var s0="{{ sig }}";setInterval(function(){fetch("{{ url_for('web.admin_share_pulse') }}",{credentials:"same-origin"}).then(function(r){return r.json()}).then(function(d){if(d.sig!==s0)location.reload()}).catch(function(){})},10000)})();</script>
+<div class="card" style="padding:14px;margin-bottom:12px"><b>📦 Packages</b>
+<p class="small mut" style="margin:6px 0">Share a package by hand when you want. Open a package and tap Post.</p>
+<div class="row"><a class="btn gold sm" href="{{ url_for('web.admin_packages') }}">📦 Open packages</a></div></div>
 <div class="card" style="padding:14px;margin-bottom:12px"><b>🎬 Shop Reel: many products in one video</b>
 <p class="small mut" style="margin:6px 0">One Reel for the whole shop with intense music. Every time it shows products that were not in the last one. Made when you post, removed after sending.</p>
 <div class="row"><a class="btn gold sm" href="{{ url_for('web.admin_share_general') }}">🎬 Preview and post</a></div>
@@ -4676,6 +4720,7 @@ def register(flask_app, cfg):
     from werkzeug.middleware.proxy_fix import ProxyFix
     CFG.update(cfg)
     init_web_db()
+    _pkg_init()
     refresh_fabrics(True)
     # A stable secret key (kept in the database volume) so people stay signed in across redeploys.
     secret = os.environ.get("SECRET_KEY")
@@ -6022,4 +6067,582 @@ def admin_share_general_auto():
             set_setting("auto_done_" + _slot_key(kind, s), "1")
     t = gen_times()
     flash("Saved. Shop Reel: " + (("on, at " + " and ".join(t.values()) + " (Nigeria time)") if auto_gen_on() and t else "off. Post it by hand whenever you like."))
+    return redirect(url_for("web.admin_share"))
+
+
+# ================================================================== PACKAGES (a ready-made set of products sold as one)
+# He builds a package from products of any category (Marriage package, Umrah Silver, Umrah Premium ...). The price is the
+# sum of the products' own current prices. The customer picks colour and fabric for every product inside it. A sold-out
+# product can be replaced by another product of the same category. A package becomes ONE line in the cart and in the
+# order text; the order items are stored product by product, so everything else in the app keeps working.
+def _pkg_init():
+    c = sqlite3.connect(CFG["DB"])
+    c.executescript("""
+        CREATE TABLE IF NOT EXISTS packages(
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, grp TEXT DEFAULT '', description TEXT DEFAULT '',
+            active INTEGER DEFAULT 1, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+        CREATE TABLE IF NOT EXISTS package_items(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, package_id TEXT NOT NULL, product_id TEXT NOT NULL,
+            qty REAL DEFAULT 1, category TEXT DEFAULT '', position INTEGER DEFAULT 0);
+        CREATE INDEX IF NOT EXISTS idx_pkgitems ON package_items(package_id);""")
+    c.commit()
+    c.close()
+
+
+def pkg_get(pid, active_only=True):
+    r = db().execute("SELECT * FROM packages WHERE id=?", (pid,)).fetchone()
+    return r if r and (r["active"] or not active_only) else None
+
+
+def pkg_slots(pid):
+    return db().execute("SELECT * FROM package_items WHERE package_id=? ORDER BY position,id", (pid,)).fetchall()
+
+
+def pkg_options(p):
+    """What the customer can choose for a product inside a package: (fabric prices, colours). Same rules as the product page."""
+    is_color = (p["category"] or "").lower() in color_categories()
+    allfp = fabric_prices(p["id"])
+    fp = allfp if is_color else {k: v for k, v in allfp.items() if is_unit_key(k)}
+    colors = db().execute("SELECT * FROM color_options WHERE active=1 ORDER BY id").fetchall() if is_color else []
+    return fp, colors
+
+
+def pkg_unavailable(p):
+    return (not p) or (not p["active"]) or bool(p["sold_out"])
+
+
+def pkg_replacements(slot, exclude=()):
+    cat = slot["category"]
+    if not cat:
+        r = db().execute("SELECT category FROM products WHERE id=?", (slot["product_id"],)).fetchone()
+        cat = r["category"] if r else ""
+    if not cat:
+        return []
+    return [r for r in db().execute("SELECT * FROM products WHERE category=? AND active=1 AND COALESCE(sold_out,0)=0 ORDER BY name", (cat,)).fetchall()
+            if r["id"] not in exclude]
+
+
+def pkg_range(pid):
+    """(lowest, highest) price of the whole package over all fabric choices."""
+    lo = hi = 0
+    for s in pkg_slots(pid):
+        p = db().execute("SELECT * FROM products WHERE id=?", (s["product_id"],)).fetchone()
+        if not p:
+            continue
+        fp, _c = pkg_options(p)
+        vals = list(fp.values()) or [p["price"] or 0]
+        lo += line_total(min(vals), s["qty"])
+        hi += line_total(max(vals), s["qty"])
+    return lo, hi
+
+
+def pkg_price_text(pid):
+    lo, hi = pkg_range(pid)
+    return money(lo) if lo == hi else "from " + money(lo)
+
+
+def pkg_cover_ids(pid, n=4):
+    out = []
+    for s in pkg_slots(pid):
+        p = db().execute("SELECT * FROM products WHERE id=?", (s["product_id"],)).fetchone()
+        if not p:
+            continue
+        ph = [x for x in product_photos(p["id"]) if not x["sold_out"]] or product_photos(p["id"])
+        if ph:
+            out.append(ph[0]["file_id"])
+        if len(out) >= n:
+            break
+    return out
+
+
+def pkg_collage(fids, size=1080):
+    """A square picture made of the package's product photos (1 to 4). Made on the spot, never stored."""
+    from PIL import Image, ImageOps
+    n = max(1, len(fids))
+    cells = {1: [(0, 0, 1, 1)], 2: [(0, 0, .5, 1), (.5, 0, 1, 1)], 3: [(0, 0, .5, 1), (.5, 0, 1, .5), (.5, .5, 1, 1)],
+             4: [(0, 0, .5, .5), (.5, 0, 1, .5), (0, .5, .5, 1), (.5, .5, 1, 1)]}[min(4, n)]
+    im = Image.new("RGB", (size, size), (240, 236, 228))
+    gap = 6 if n > 1 else 0
+    for fid, (x0, y0, x1, y1) in zip(fids, cells):
+        path = fetch_file(fid)
+        if not path:
+            continue
+        try:
+            ph = Image.open(path).convert("RGB")
+            box = (int(x0 * size) + (gap if x0 else 0), int(y0 * size) + (gap if y0 else 0), int(x1 * size), int(y1 * size))
+            tile = ImageOps.fit(ph, (box[2] - box[0] - (gap if x1 < 1 else 0), box[3] - box[1] - (gap if y1 < 1 else 0)), method=Image.LANCZOS, centering=(.5, .4))
+            ph.close()
+            im.paste(tile, (box[0], box[1]))
+        except Exception:
+            continue
+    return im
+
+
+@bp.get("/package/<pid>/cover.jpg")
+def package_cover(pid):
+    if not pkg_get(pid):
+        abort(404)
+    fids = pkg_cover_ids(pid)
+    data = _gen_cached(("pkgcover", pid, tuple(fids)), lambda: _jpeg_bytes(pkg_collage(fids, 720), 84))
+    return Response(data, mimetype="image/jpeg", headers={"Cache-Control": "public, max-age=300"})
+
+
+def _jpeg_bytes(im, q=88):
+    buf = io.BytesIO()
+    im.save(buf, "JPEG", quality=q)
+    return buf.getvalue()
+
+
+def pkg_post_image(pid):
+    """The picture that goes to Facebook and Instagram: the collage inside the usual 4:5 frame with the logo strip."""
+    p = db().execute("SELECT * FROM packages WHERE id=?", (pid,)).fetchone()
+    fids = pkg_cover_ids(pid)
+    return _jpeg_bytes(brand_frame(pkg_collage(fids, 1080), _brand_logo_small()), 90), p
+
+
+@bp.get("/package/<pid>/card.jpg")
+def package_card(pid):
+    """Ready-to-share picture for WhatsApp: collage, package name, the price and the logo strip."""
+    pkg = pkg_get(pid)
+    if not pkg:
+        abort(404)
+    from PIL import Image, ImageDraw
+    fids = pkg_cover_ids(pid)
+    names = [db().execute("SELECT name FROM products WHERE id=?", (s["product_id"],)).fetchone() for s in pkg_slots(pid)]
+    names = [n["name"] for n in names if n]
+    ckey = ("pkgcard", pid, pkg["name"], tuple(fids), pkg_price_text(pid), tuple(names), setting("web_logo"))
+
+    def build():
+        W = 1080
+        pic = pkg_collage(fids, W)
+        fn, fl, fa = _font(54), _font(34, bold=False), _font(56)
+        shown = names[:6]
+        foot = 40 + 80 + len(shown) * 46 + (46 if len(names) > 6 else 0) + 90 + 150
+        im = Image.new("RGB", (W, W + foot), (17, 17, 17))
+        im.paste(pic, (0, 0))
+        d = ImageDraw.Draw(im)
+        d.rectangle((0, W, W, W + 8), fill=(201, 162, 75))
+        y = W + 34
+        nm = pkg["name"]
+        while d.textlength(nm, font=fn) > W - 80 and len(nm) > 6:
+            nm = nm[:-2]
+        d.text((40, y), nm + ("…" if nm != pkg["name"] else ""), font=fn, fill=(255, 255, 255))
+        y += 84
+        for n in shown:
+            t = n
+            while d.textlength("•  " + t, font=fl) > W - 80 and len(t) > 6:
+                t = t[:-2]
+            d.text((40, y), "•  " + t + ("…" if t != n else ""), font=fl, fill=(225, 225, 225))
+            y += 46
+        if len(names) > 6:
+            d.text((40, y), f"+ {len(names) - 6} more", font=fl, fill=(190, 190, 190))
+            y += 46
+        d.text((40, y + 14), pkg_price_text(pid), font=fa, fill=(230, 195, 107))
+        y += 100
+        d.line([(40, y), (W - 40, y)], fill=(201, 162, 75), width=2)
+        em, bx = _brand_logo_small(), 40
+        if em is not None:
+            im.paste(em.convert("RGB"), (bx, y + 22), em.split()[-1])
+            bx += 104 + 24
+        d.text((bx, y + 28), "AD FASHION SHOP", font=_font(44), fill=(214, 168, 64))
+        d.text((bx, y + 84), "Modesty  •  Elegance  •  Quality", font=_font(26, bold=False), fill=(205, 205, 205))
+        return _jpeg_bytes(im.crop((0, 0, W, y + 150)), 88)
+    data = _gen_cached(ckey, build) if fids else build()
+    return Response(data, mimetype="image/jpeg", headers={"Cache-Control": "no-cache"})
+
+
+@bp.get("/pubpkg/<sig>/<pid>.jpg")
+def pubpkg(sig, pid):
+    """Public (signed) link to the package picture. Facebook and Instagram download it from here when you post."""
+    import hmac
+    if not hmac.compare_digest(sig, _pub_sig("pkg/" + pid)) or not pkg_get(pid, active_only=False):
+        abort(404)
+    data, _p = pkg_post_image(pid)
+    return Response(data, mimetype="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+def pkg_share_text(pkg):
+    lines = [f"*{pkg['name']}*", "📦 What is inside:"]
+    for s in pkg_slots(pkg["id"]):
+        p = db().execute("SELECT name FROM products WHERE id=?", (s["product_id"],)).fetchone()
+        if p:
+            lines.append(f"• {p['name']}" + (f" x{fmt_qty(s['qty'])}" if s["qty"] != 1 else ""))
+    lines.append(f"💰 {pkg_price_text(pkg['id'])}")
+    if pkg["description"]:
+        lines.append(pkg["description"].strip()[:160])
+    lines.append(f"🛍️ Order here: {url_for('web.package_view', pid=pkg['id'], _external=True)}")
+    lines.append(f"— {APP_NAME}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- customer pages
+def pkg_cards():
+    out = []
+    for r in db().execute("SELECT * FROM packages WHERE active=1 ORDER BY grp, name").fetchall():
+        if pkg_slots(r["id"]):
+            out.append({"id": r["id"], "name": r["name"], "grp": r["grp"] or "", "price": pkg_price_text(r["id"]),
+                        "n": len(pkg_slots(r["id"]))})
+    return out
+
+
+PKG_CARD = """{% macro kcard(k) %}<a class="card pc" href="{{ url_for('web.package_view', pid=k.id) }}">
+<img loading="lazy" src="{{ url_for('web.package_cover', pid=k.id) }}" alt="{{ k.name }}"><div class="b"><div class="t">{{ k.name }}</div>
+<div class="price">{{ k.price }}</div><div class="small mut">{{ k.n }} item{{ '' if k.n==1 else 's' }}</div></div></a>{% endmacro %}"""
+
+
+@bp.get("/packages")
+def packages_page():
+    cards = pkg_cards()
+    groups = {}
+    for k in cards:
+        groups.setdefault(k["grp"] or "Packages", []).append(k)
+    return page("Packages", PKG_CARD + """
+<h2>📦 Packages</h2><p class="mut" style="margin-top:0">Ready-made sets. Choose a package, pick your colours, and order it in one go.</p>
+{% if not groups %}<p class="mut">No packages yet. Please check back soon.</p>{% endif %}
+{% for g, ks in groups.items() %}<div class="sec"><h3>{{ g }}</h3></div><div class="grid">{% for k in ks %}{{ kcard(k) }}{% endfor %}</div>{% endfor %}""",
+                tab="shop", groups=groups)
+
+
+def _pkg_view_items(pkg, swaps):
+    items = []
+    for s in pkg_slots(pkg["id"]):
+        orig = db().execute("SELECT * FROM products WHERE id=?", (s["product_id"],)).fetchone()
+        gone = pkg_unavailable(orig)
+        p, repl = orig, []
+        if gone:
+            repl = pkg_replacements(s, exclude=(s["product_id"],))
+            ch = swaps.get(str(s["id"]))
+            sub = next((r for r in repl if r["id"] == ch), None)
+            p = sub                                   # None until the customer has chosen a replacement
+        fp, colors = pkg_options(p) if p else ({}, [])
+        items.append({"slot": s["id"], "qty": s["qty"], "orig": orig, "p": p, "gone": gone, "repl": repl, "fp": fp, "colors": colors,
+                      "unit": (UNIT_WORD.get(next(iter(fp), None), "") if fp and not (p["category"] or "").lower() in color_categories() else "") if p else "",
+                      "photo": (product_photos(p["id"])[0]["file_id"] if p and product_photos(p["id"]) else "")})
+    return items
+
+
+@bp.get("/package/<pid>")
+def package_view(pid):
+    pkg = pkg_get(pid)
+    if not pkg:
+        abort(404)
+    swaps = {}
+    for x in request.args.getlist("sw"):
+        a, _, b = x.partition("~")
+        swaps[a] = b
+    items = _pkg_view_items(pkg, swaps)
+    need = [i for i in items if i["gone"] and not i["p"]]
+    js_items = [{"slot": i["slot"], "q": i["qty"], "base": (i["p"]["price"] if i["p"] else 0), "fp": i["fp"]} for i in items]
+    return page(pkg["name"], """
+<div class="two"><div><img src="{{ url_for('web.package_cover', pid=pkg['id']) }}" alt="" style="width:100%;border-radius:16px"></div><div>
+<span class="tag g">📦 Package</span><h1 style="margin:.2em 0">{{ pkg['name'] }}</h1>
+<div class="price" style="font-size:24px" id="ptotal">{{ ptext }}</div>
+{% if pkg['description'] %}<p>{{ pkg['description'] }}</p>{% endif %}
+<p class="mut small" style="margin:.2em 0 12px">The price is the total of the products inside. Choose your colour and fabric for each one.</p></div></div>
+<form method="post" action="{{ url_for('web.package_add', pid=pkg['id']) }}" id="pf"><input type="hidden" name="csrf" value="{{ csrf }}">
+{% for i in items %}<div class="card" style="padding:12px;margin-bottom:10px">
+<div class="row" style="flex-wrap:nowrap;gap:10px">{% if i.photo %}<img class="th" src="{{ url_for('web.img', fid=i.photo) }}" alt="" style="width:64px;height:64px;object-fit:cover;border-radius:10px">{% endif %}
+<div class="grow"><b>{{ i.p['name'] if i.p else i.orig['name'] if i.orig else 'Product' }}</b>{% if i.qty != 1 %} <span class="tag">× {{ fq(i.qty) }}{{ ' ' ~ i.unit ~ 's' if i.unit }}</span>{% endif %}
+{% if i.p %}<div class="small mut">{{ display_price(i.p) }}</div>{% endif %}</div></div>
+{% if i.gone %}<div style="margin-top:8px;padding:8px;border-radius:10px;background:#fdecea"><div class="small" style="color:#b3261e"><b>{{ i.orig['name'] if i.orig else 'This product' }} is sold out.</b> Please choose another one from the same category:</div>
+{% if i.repl %}<select class="swap" data-slot="{{ i.slot }}" style="margin-top:6px;width:100%"><option value="">Choose a replacement…</option>
+{% for r in i.repl %}<option value="{{ r['id'] }}" {{ 'selected' if i.p and i.p['id']==r['id'] }}>{{ r['name'] }} · {{ display_price(r) }}</option>{% endfor %}</select>
+{% else %}<div class="small mut">No replacement is available right now.</div>{% endif %}</div>{% endif %}
+{% if i.p %}<input type="hidden" name="pid_{{ i.slot }}" value="{{ i.p['id'] }}">
+{% if i.fp %}<label class="l">{{ 'How do you want to buy?' if i.unit else 'Choose fabric' }}</label>
+{% for k,v in i.fp.items() %}<label class="opt"><input type="radio" name="fab_{{ i.slot }}" value="{{ k }}" required {{ 'checked' if loop.first }}><span class="grow"><b>{{ fabric_name[k] }}</b></span><span class="price">{{ money(v) }}</span></label>{% endfor %}{% endif %}
+{% if i.colors %}<label class="l">Choose colour</label><div class="swatches">{% for co in i.colors %}<label class="sw"><input type="radio" name="col_{{ i.slot }}" value="{{ co['id'] }}" {{ 'checked' if loop.first }}><img src="{{ url_for('web.img', fid=co['photo_file_id']) }}" alt="Colour {{ co['id'] }}"></label>{% endfor %}</div>{% endif %}{% endif %}
+</div>{% endfor %}
+<label class="l">How many packages?</label><div class="qty"><button type="button" onclick="pq(-1)">−</button><input type="number" name="qty" id="pqty" value="1" min="1" max="20" inputmode="numeric" oninput="pu()"><button type="button" onclick="pq(1)">+</button></div>
+{% if need %}<p class="tag bad" style="display:block;margin-top:14px;padding:10px;text-align:center">Please choose a replacement for the sold-out product above to continue.</p>
+<button class="btn grow block" type="button" disabled style="opacity:.5;margin-top:10px">Choose replacement first</button>
+{% else %}<div class="row" style="margin-top:16px"><button class="btn gold grow">{{ icon('cart') }} Add package to cart</button>
+<button type="button" class="btn wa" data-card="{{ url_for('web.package_card', pid=pkg['id']) }}" data-more="" data-pre="{{ 1 if is_admin else 0 }}" data-text="{{ share_msg }}" onclick="shareCard(this)">Share</button></div>{% endif %}
+</form>
+<script>
+var PI={{ js_items|tojson }};
+function pu(){var t=0;PI.forEach(function(it){if(!it.base&&!Object.keys(it.fp).length)return;var f=document.querySelector('input[name=fab_'+it.slot+']:checked');var u=f&&it.fp[f.value]!=null?it.fp[f.value]:it.base;t+=Math.round((u||0)*it.q);});
+var q=parseInt(document.getElementById('pqty').value)||1;q=Math.max(1,Math.min(20,q));document.getElementById('ptotal').textContent='₦'+(t*q).toLocaleString()+(q>1?'  ('+q+' × ₦'+t.toLocaleString()+')':'');}
+function pq(n){var i=document.getElementById('pqty');i.value=Math.max(1,Math.min(20,(parseInt(i.value)||1)+n));pu();}
+document.querySelectorAll('#pf input[type=radio]').forEach(function(r){r.addEventListener('change',pu)});pu();
+document.querySelectorAll('.swap').forEach(function(s){s.addEventListener('change',function(){var u=new URL(location.href);var cur=u.searchParams.getAll('sw').filter(function(x){return x.split('~')[0]!==s.dataset.slot});u.searchParams.delete('sw');cur.forEach(function(x){u.searchParams.append('sw',x)});if(s.value)u.searchParams.append('sw',s.dataset.slot+'~'+s.value);location.href=u.toString();});});
+</script>""", tab="shop", pkg=pkg, items=items, need=need, js_items=js_items, ptext=pkg_price_text(pkg["id"]),
+                share_msg=pkg_share_text(pkg))
+
+
+def pkg_make_sel(parts):
+    return ";".join("~".join(str(x or "") for x in p) for p in parts)
+
+
+@bp.post("/package/<pid>/add")
+def package_add(pid):
+    pkg = pkg_get(pid)
+    if not pkg:
+        abort(404)
+    parts = []
+    for s in pkg_slots(pid):
+        orig = db().execute("SELECT * FROM products WHERE id=?", (s["product_id"],)).fetchone()
+        want = request.form.get(f"pid_{s['id']}", "")
+        p = orig
+        if pkg_unavailable(orig):
+            p = next((r for r in pkg_replacements(s, exclude=(s["product_id"],)) if r["id"] == want), None)
+            if not p:
+                flash("Please choose a replacement for the sold-out product first.")
+                return redirect(url_for("web.package_view", pid=pid))
+        fp, colors = pkg_options(p)
+        fab = None
+        if fp:
+            fab = request.form.get(f"fab_{s['id']}")
+            if fab not in fp:
+                flash("Please choose a fabric for every product.")
+                return redirect(url_for("web.package_view", pid=pid))
+        cid = request.form.get(f"col_{s['id']}", "")
+        cid = int(cid) if cid.isdigit() and any(str(c["id"]) == cid for c in colors) else ""
+        parts.append((s["id"], p["id"], cid, fab))
+    if not parts:
+        flash("This package is empty for now.")
+        return redirect(url_for("web.packages_page"))
+    qty = to_int(request.form.get("qty"), 1, 1, 20)
+    key = f"pk|{pid}|{pkg_make_sel(parts)}"
+    cart()[key] = min(20, cart().get(key, 0) + qty)
+    session.modified = True
+    flash(f"Added {pkg['name']} to your cart.")
+    return redirect(url_for("web.cart_view"))
+
+
+def pkg_cart_line(key, qty):
+    """A package line of the cart, priced from today's product prices. None if the package is gone."""
+    try:
+        _pk, pid, sel = key.split("|", 2)
+    except ValueError:
+        return None
+    pkg = pkg_get(pid)
+    if not pkg:
+        return None
+    slots = {str(s["id"]): s for s in pkg_slots(pid)}
+    subs, total = [], 0
+    for chunk in sel.split(";"):
+        bits = (chunk.split("~") + ["", "", "", ""])[:4]
+        slot, ppid, cid, fab = bits
+        s = slots.get(slot)
+        p = db().execute("SELECT * FROM products WHERE id=? AND active=1", (ppid,)).fetchone()
+        if not s or not p:
+            return None
+        fp, _c = pkg_options(p)
+        fab = fab if fab in fp else None
+        color = db().execute("SELECT * FROM color_options WHERE id=?", (int(cid),)).fetchone() if cid.isdigit() else None
+        price = unit_price(p, fab) or 0
+        each = line_total(price, s["qty"])
+        all_ = line_total(price, s["qty"] * qty)
+        total += all_
+        subs.append({"p": p, "qty": s["qty"], "qty_all": s["qty"] * qty, "price": price, "each": each, "line_all": all_, "color": color,
+                     "fab": fab, "fab_name": FABRIC_NAME.get(fab, ""), "unit": UNIT_WORD.get(fab, "") if is_unit_key(fab) else "",
+                     "gone": bool(p["sold_out"])})
+    one = sum(x["each"] for x in subs)
+    return {"key": key, "pkg": pkg, "qty": qty, "line": total, "one": one, "subs": subs, "p": None, "step": 1}
+
+
+# ---------------------------------------------------------------- admin
+def _pkg_groups():
+    return [r[0] for r in db().execute("SELECT DISTINCT grp FROM packages WHERE grp!='' ORDER BY grp").fetchall()]
+
+
+@bp.get("/admin/packages")
+@admin_required
+def admin_packages():
+    rows = db().execute("SELECT * FROM packages ORDER BY grp, name").fetchall()
+    data = [{"r": r, "n": len(pkg_slots(r["id"])), "price": pkg_price_text(r["id"])} for r in rows]
+    return admin_page("Packages", """<h2>📦 Packages</h2>
+<p class="mut small">A package is a ready-made set of products. Customers choose it and order everything in one go. Packages are shared by hand from here, never automatically.</p>
+{% for d in data %}<a class="card" href="{{ url_for('web.admin_package', pid=d.r['id']) }}" style="display:block;padding:12px;margin-bottom:8px;text-decoration:none">
+<div class="row between"><b>{{ d.r['name'] }}</b><span class="tag {{ 'g' if d.r['active'] else 'bad' }}">{{ 'Live' if d.r['active'] else 'Hidden' }}</span></div>
+<div class="small mut">{{ d.r['grp'] or 'No group' }} · {{ d.n }} item(s) · {{ d.price }}</div></a>{% endfor %}
+<form method="post" action="{{ url_for('web.admin_package_new') }}" class="card" style="padding:14px;margin-top:10px"><input type="hidden" name="csrf" value="{{ csrf }}">
+<b>New package</b><label class="l">Name (for example Umrah Silver Package)</label><input name="name" required maxlength="80">
+<label class="l">Group (for example Umrah, Marriage)</label><input name="grp" list="grps" maxlength="40"><datalist id="grps">{% for g in groups %}<option value="{{ g }}">{% endfor %}</datalist>
+<p><button class="btn gold">Create and add products</button></p></form>""", data=data, groups=_pkg_groups())
+
+
+@bp.post("/admin/packages/new")
+@admin_required
+def admin_package_new():
+    name = request.form.get("name", "").strip()[:80]
+    if not name:
+        flash("Please give the package a name.")
+        return redirect(url_for("web.admin_packages"))
+    pid = secrets.token_hex(3)
+    db().execute("INSERT INTO packages(id,name,grp) VALUES(?,?,?)", (pid, name, request.form.get("grp", "").strip()[:40]))
+    db().commit()
+    return redirect(url_for("web.admin_package", pid=pid))
+
+
+@bp.get("/admin/package/<pid>")
+@admin_required
+def admin_package(pid):
+    pkg = pkg_get(pid, active_only=False)
+    if not pkg:
+        abort(404)
+    slots = []
+    for s in pkg_slots(pid):
+        p = db().execute("SELECT * FROM products WHERE id=?", (s["product_id"],)).fetchone()
+        slots.append({"s": s, "p": p, "bad": pkg_unavailable(p)})
+    cat = request.args.get("c") if request.args.get("c") in cats() else ""
+    q = (request.args.get("q") or "").strip()
+    pool = products(cat or None, q or None) if (cat or q) else []
+    have = {s["s"]["product_id"] for s in slots}
+    rdy = social_ready()
+    sh = to_int(request.args.get("n"), 0) or 0
+    return admin_page("Package " + pkg["name"], """<p><a href="{{ url_for('web.admin_packages') }}">‹ Packages</a></p>
+<h2>📦 {{ pkg['name'] }}</h2><p class="mut small">Customers pay: <b>{{ ptext }}</b> (added up from the products' own prices).</p>
+<form method="post" action="{{ url_for('web.admin_package_save', pid=pkg['id']) }}" class="card" style="padding:14px"><input type="hidden" name="csrf" value="{{ csrf }}">
+<label class="l">Name</label><input name="name" value="{{ pkg['name'] }}" required maxlength="80">
+<label class="l">Group</label><input name="grp" value="{{ pkg['grp'] }}" list="grps" maxlength="40"><datalist id="grps">{% for g in groups %}<option value="{{ g }}">{% endfor %}</datalist>
+<label class="l">Short description (optional)</label><textarea name="description" rows="2" maxlength="300">{{ pkg['description'] }}</textarea>
+<label class="opt"><input type="checkbox" name="active" value="1" {{ 'checked' if pkg['active'] }}><span class="grow"><b>Show this package in the shop</b></span></label>
+<p><button class="btn gold">Save</button></p></form>
+<h3 style="margin-top:16px">Products inside ({{ slots|length }})</h3>
+{% for x in slots %}<div class="card" style="padding:10px;margin-bottom:8px"><div class="row between" style="flex-wrap:nowrap"><div class="grow"><b>{{ x.p['name'] if x.p else 'Deleted product' }}</b>
+{% if x.bad %}<span class="tag bad">{{ 'sold out' if x.p and x.p['active'] else 'not available' }}</span>{% endif %}<div class="small mut">{{ display_price(x.p) if x.p else '' }}</div></div>
+<form method="post" action="{{ url_for('web.admin_package_item', pid=pkg['id'], iid=x.s['id']) }}" class="row" style="flex-wrap:nowrap;gap:6px"><input type="hidden" name="csrf" value="{{ csrf }}">
+<input name="qty" value="{{ fq(x.s['qty']) }}" inputmode="decimal" style="width:62px" aria-label="Quantity"><button class="btn alt sm" name="do" value="qty">OK</button><button class="btn alt sm" name="do" value="remove" aria-label="Remove">{{ icon('trash') }}</button></form></div></div>
+{% else %}<p class="mut">No products yet. Add some below.</p>{% endfor %}
+<p class="mut small">Quantity is how many of that product come in the package (for fabrics you can use 2.5 yards).</p>
+<h3 style="margin-top:16px">Add products</h3>
+<form method="get" class="row" style="flex-wrap:nowrap"><select name="c" class="grow"><option value="">Choose a category…</option>{% for k,v in cats.items() %}<option value="{{ k }}" {{ 'selected' if k==cat }}>{{ v }}</option>{% endfor %}</select>
+<input name="q" value="{{ q }}" placeholder="or search" style="width:40%"><button class="btn sm">Go</button></form>
+{% for p in pool %}<div class="card row between" style="padding:8px 10px;margin:6px 0;flex-wrap:nowrap"><div class="grow"><b>{{ p['name'] }}</b><div class="small mut">{{ display_price(p) }}</div></div>
+{% if p['id'] in have %}<span class="tag g">added</span>{% else %}<form method="post" action="{{ url_for('web.admin_package_add', pid=pkg['id']) }}"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="product" value="{{ p['id'] }}"><input type="hidden" name="back" value="{{ request.full_path }}"><button class="btn gold sm">➕ Add</button></form>{% endif %}</div>{% endfor %}
+{% if (cat or q) and not pool %}<p class="mut">Nothing found.</p>{% endif %}
+<h3 style="margin-top:18px">📣 Share this package</h3>
+<div class="card" style="padding:12px"><b>🟢 WhatsApp</b><p class="mut small" style="margin:4px 0 8px">Sends the picture with the items and the price. Choose a chat, a group, or <b>My status</b>.</p>
+<button type="button" class="btn wa sm" data-card="{{ url_for('web.package_card', pid=pkg['id']) }}" data-more="" data-pre="1" data-text="{{ wa }}" onclick="shareCard(this)">Share picture on WhatsApp / Status</button></div>
+<form method="post" action="{{ url_for('web.admin_package_share', pid=pkg['id']) }}" class="card" style="padding:14px;margin-top:10px"><input type="hidden" name="csrf" value="{{ csrf }}">
+{% if rdy.fb %}<label class="l"><input type="checkbox" name="do_fb" value="1" checked> Facebook Page</label><textarea name="cap_fb" rows="7">{{ cap_fb }}</textarea>{% endif %}
+<label class="l" style="margin-top:10px"><input type="checkbox" name="do_ig" value="1" {{ 'checked' if rdy.ig else 'disabled' }}> Instagram {{ '' if rdy.ig else '(not connected)' }}</label><textarea name="cap_ig" rows="9">{{ cap_ig }}</textarea>
+<div class="row" style="margin-top:10px"><button class="btn gold">📣 Post now</button><a class="btn alt" href="{{ url_for('web.admin_package', pid=pkg['id'], n=shn+1) }}">🔄 New caption</a></div>
+<p class="mut small">Only when you tap Post. Packages never go out automatically.</p></form>
+<form method="post" action="{{ url_for('web.admin_package_delete', pid=pkg['id']) }}" style="margin-top:14px" onsubmit="return confirm('Delete this package?')"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn alt sm">🗑 Delete package</button></form>""",
+                      pkg=pkg, slots=slots, cats=cats(), cat=cat, q=q, pool=pool, have=have, groups=_pkg_groups(), ptext=pkg_price_text(pid),
+                      rdy=rdy, shn=sh, wa=pkg_share_text(pkg), cap_fb=pkg_caption(pkg, "fb", sh), cap_ig=pkg_caption(pkg, "ig", sh))
+
+
+@bp.post("/admin/package/<pid>/save")
+@admin_required
+def admin_package_save(pid):
+    if not pkg_get(pid, active_only=False):
+        abort(404)
+    name = request.form.get("name", "").strip()[:80]
+    if not name:
+        flash("The package needs a name.")
+        return redirect(url_for("web.admin_package", pid=pid))
+    db().execute("UPDATE packages SET name=?, grp=?, description=?, active=? WHERE id=?",
+                 (name, request.form.get("grp", "").strip()[:40], request.form.get("description", "").strip()[:300],
+                  1 if request.form.get("active") else 0, pid))
+    db().commit()
+    flash("Saved.")
+    return redirect(url_for("web.admin_package", pid=pid))
+
+
+@bp.post("/admin/package/<pid>/add")
+@admin_required
+def admin_package_add(pid):
+    if not pkg_get(pid, active_only=False):
+        abort(404)
+    p = db().execute("SELECT * FROM products WHERE id=?", (request.form.get("product", ""),)).fetchone()
+    if p and not db().execute("SELECT 1 FROM package_items WHERE package_id=? AND product_id=?", (pid, p["id"])).fetchone():
+        pos = db().execute("SELECT COALESCE(MAX(position),0)+1 FROM package_items WHERE package_id=?", (pid,)).fetchone()[0]
+        db().execute("INSERT INTO package_items(package_id,product_id,qty,category,position) VALUES(?,?,1,?,?)", (pid, p["id"], p["category"] or "", pos))
+        db().commit()
+    back = request.form.get("back", "")
+    return redirect(back if back.startswith("/admin/package/") else url_for("web.admin_package", pid=pid))
+
+
+@bp.post("/admin/package/<pid>/item/<int:iid>")
+@admin_required
+def admin_package_item(pid, iid):
+    if request.form.get("do") == "remove":
+        db().execute("DELETE FROM package_items WHERE id=? AND package_id=?", (iid, pid))
+    else:
+        q = parse_qty(request.form.get("qty"), decimal=True, lo=0.25, hi=100)
+        if q is None:
+            flash("Please enter a quantity such as 1 or 2.5.")
+        else:
+            db().execute("UPDATE package_items SET qty=? WHERE id=? AND package_id=?", (q, iid, pid))
+    db().commit()
+    return redirect(url_for("web.admin_package", pid=pid))
+
+
+@bp.post("/admin/package/<pid>/delete")
+@admin_required
+def admin_package_delete(pid):
+    db().execute("DELETE FROM package_items WHERE package_id=?", (pid,))
+    db().execute("DELETE FROM packages WHERE id=?", (pid,))
+    db().commit()
+    flash("Package deleted.")
+    return redirect(url_for("web.admin_packages"))
+
+
+# ---- sharing by hand
+_PKG_HOOK = ["📦 One package. Everything you need.", "💍 Ready-made for your big day. Everything in one package.", "🕋 Your Umrah outfit, sorted in one package.",
+             "✨ Save time. Get the full set in one order.", "🎁 A complete set, chosen for you by AD FASHION SHOP"]
+_PKG_CTA = ["📲 Tap the link in our bio to order the package", "💬 Message us on WhatsApp to order today", "🛍️ Order from the link in our bio. We deliver anywhere in Nigeria 🚚"]
+
+
+def pkg_caption(pkg, plat, n=0):
+    import random
+    rnd = random.Random(f"pkg-{pkg['id']}-{n}-{plat}")
+    names = []
+    for s in pkg_slots(pkg["id"]):
+        p = db().execute("SELECT name FROM products WHERE id=?", (s["product_id"],)).fetchone()
+        if p:
+            names.append(p["name"])
+    body = "Inside:\n" + "\n".join("• " + x for x in names[:8]) + ("\n• and more" if len(names) > 8 else "")
+    tags = ["#ADFashion", "#ADFashionShop"] + rnd.sample(_TAGS_BIG, 3) + rnd.sample(_TAGS_LOCAL, 3) + rnd.sample(_TAGS_SHOP, 2) + (rnd.sample(_TAGS_REACH, 1) if plat == "ig" else [])
+    parts = [rnd.choice(_PKG_HOOK), f"{pkg['name']}  {pkg_price_text(pkg['id'])}", body, (pkg["description"] or "").strip(), rnd.choice(_PKG_CTA), " ".join(tags)]
+    return "\n\n".join(x for x in parts if x)[:2100]
+
+
+def pkg_pub_url(pid):
+    return f"{site_base()}/pubpkg/{_pub_sig('pkg/' + pid)}/{pid}.jpg"
+
+
+def do_share_package(pkg, want, caps):
+    rdy, out, label_of = social_ready(), [], {"fb": "Facebook", "ig": "Instagram"}
+    url = pkg_pub_url(pkg["id"])
+    for plat, fn in (("fb", post_facebook), ("ig", post_instagram)):
+        if plat not in want or not rdy[plat]:
+            continue
+        label = label_of[plat]
+        caption = ((caps or {}).get(plat) or "").strip() or pkg_caption(pkg, plat)
+        try:
+            rid = fn([url], caption[:2100])
+            db().execute("INSERT INTO social_posts(product_id,platform,status,remote_id,caption,auto) VALUES(?,?,?,?,?,0)",
+                         ("pkg:" + pkg["id"], label, "ok", str(rid), caption[:2100]))
+            out.append(f"✅ Posted to {label}")
+        except Exception as e:
+            db().execute("INSERT INTO social_posts(product_id,platform,status,error,auto) VALUES(?,?,?,?,0)",
+                         ("pkg:" + pkg["id"], label, "failed", str(e)[:300]))
+            out.append(f"❌ {label} failed: {e}")
+        db().commit()
+    return out
+
+
+@bp.post("/admin/package/<pid>/share")
+@admin_required
+def admin_package_share(pid):
+    pkg = pkg_get(pid, active_only=False)
+    if not pkg:
+        abort(404)
+    want = [pl for pl in ("fb", "ig") if request.form.get("do_" + pl)]
+    if not want:
+        flash("Choose Facebook or Instagram first.")
+        return redirect(url_for("web.admin_package", pid=pid))
+    if not pkg_cover_ids(pid):
+        flash("Add at least one product with a picture first.")
+        return redirect(url_for("web.admin_package", pid=pid))
+    caps = {pl: request.form.get("cap_" + pl, "").strip() for pl in ("fb", "ig")}
+    if queue_job("package", "pkg:" + pid, want, [], caps) is None:
+        flash("This package is already being sent. Please wait a moment.")
+    else:
+        flash("📤 Sending in the background. You can leave this page. We will notify you when it is done.")
     return redirect(url_for("web.admin_share"))
