@@ -4053,10 +4053,15 @@ def run_job(flask_app, jid):
             want, picked, caps = json.loads(j["want"]), json.loads(j["picked"]), json.loads(j["caps"])
             p = db().execute("SELECT * FROM products WHERE id=?", (j["product_id"],)).fetchone() if j["product_id"] else None
             pushed = False
-            if j["kind"] == "package":
+            if j["kind"] in ("package", "pkgreel"):
                 pk = db().execute("SELECT * FROM packages WHERE id=?", ((j["product_id"] or "")[4:],)).fetchone()
                 p = {"id": j["product_id"], "name": pk["name"] if pk else "Package"}
-                msgs = do_share_package(pk, want, caps) if pk else ["❌ That package no longer exists."]
+                if not pk:
+                    msgs = ["❌ That package no longer exists."]
+                elif j["kind"] == "pkgreel":
+                    msgs = do_package_reel(pk, want, caps)
+                else:
+                    msgs = do_share_package(pk, want, caps)
             elif j["kind"] == "general":
                 p = {"id": "general", "name": "Shop Reel"}
                 msgs = do_general_reel(want, caps=caps)
@@ -4472,7 +4477,7 @@ def admin_share():
 {% if rdy.fb %}<span class="tag g">Facebook · {{ fb_name }}</span>{% endif %} {% if rdy.ig %}<span class="tag g">Instagram · @{{ ig_name }}</span>{% endif %}
 · <a href="{{ url_for('web.admin_share', refresh=1) }}">↻ Refresh names</a> · <a href="{{ url_for('web.admin_share_connect') }}">Reconnect</a></p>{% endif %}
 {% if jobs %}<div class="card" style="padding:12px;margin-bottom:12px" id="jobs"><b>📤 Sending</b>
-{% for j in jobs %}<div class="small" style="margin-top:6px"><b>{{ j['name'] }}</b>{% if j['kind'] in ('reel','autoreel','general') %} 🎬{% endif %}{% if j['kind'] in ('auto','autoreel') %} 🤖{% endif %} · {{ j['at'] }}
+{% for j in jobs %}<div class="small" style="margin-top:6px"><b>{{ j['name'] }}</b>{% if j['kind'] in ('reel','autoreel','general','pkgreel') %} 🎬{% endif %}{% if j['kind'] in ('auto','autoreel') %} 🤖{% endif %} · {{ j['at'] }}
 {% if j['status'] in ('queued','working') %}<span style="color:#b26a00">⏳ sending…</span>{% elif j['status']=='done' %}<span style="color:#2a8a4a">✅ sent</span>{% elif j['status']=='partial' %}<span style="color:#b26a00">⚠️ partly sent</span>{% else %}<span style="color:#c0392b">❌ not sent</span>{% endif %}
 {% for m in j['msgs'] %}<div class="mut">{{ m }}</div>{% endfor %}</div>{% endfor %}</div>
 {% if busy %}<script>setTimeout(function(){location.reload()},4000);</script>{% endif %}{% endif %}
@@ -6085,6 +6090,8 @@ def _pkg_init():
             id INTEGER PRIMARY KEY AUTOINCREMENT, package_id TEXT NOT NULL, product_id TEXT NOT NULL,
             qty REAL DEFAULT 1, category TEXT DEFAULT '', position INTEGER DEFAULT 0);
         CREATE INDEX IF NOT EXISTS idx_pkgitems ON package_items(package_id);""")
+    if "extra" not in {r[1] for r in c.execute("PRAGMA table_info(packages)")}:
+        c.execute("ALTER TABLE packages ADD COLUMN extra INTEGER DEFAULT 0")
     c.commit()
     c.close()
 
@@ -6124,7 +6131,8 @@ def pkg_replacements(slot, exclude=()):
 
 def pkg_range(pid):
     """(lowest, highest) price of the whole package over all fabric choices."""
-    lo = hi = 0
+    ex = db().execute("SELECT COALESCE(extra,0) FROM packages WHERE id=?", (pid,)).fetchone()
+    lo = hi = (ex[0] if ex else 0) or 0                      # the extra amount he adds on top of the products
     for s in pkg_slots(pid):
         p = db().execute("SELECT * FROM products WHERE id=?", (s["product_id"],)).fetchone()
         if not p:
@@ -6153,6 +6161,46 @@ def pkg_cover_ids(pid, n=4):
         if len(out) >= n:
             break
     return out
+
+
+def pkg_photo_fids(pid, n=9):
+    """One picture of EVERY product in the package (its first in-stock photo), up to n."""
+    out = []
+    for s in pkg_slots(pid):
+        ph = product_photos(s["product_id"])
+        ph = [x for x in ph if not x["sold_out"]] or ph
+        if ph:
+            out.append(ph[0]["file_id"])
+        if len(out) >= n:
+            break
+    return out
+
+
+def pkg_more(pid):
+    """Links to the product pictures that travel with the WhatsApp card (made on the spot, nothing stored)."""
+    return ",".join(url_for("web.package_share_photo", pid=pid, i=i) for i in range(len(pkg_photo_fids(pid))))
+
+
+@bp.get("/package/<pid>/share/<int:i>.jpg")
+def package_share_photo(pid, i):
+    if not pkg_get(pid):
+        abort(404)
+    fids = pkg_photo_fids(pid)
+    if i < 0 or i >= len(fids):
+        abort(404)
+
+    def build():
+        path = fetch_file(fids[i])
+        if not path:
+            return None
+        from PIL import Image
+        return _jpeg_bytes(brand_frame(Image.open(path).convert("RGB"), _brand_logo_small()), 88)
+    key = ("pkgsp", pid, fids[i], setting("web_logo"))
+    data = _gen_cached(key, build)
+    if not data:
+        _GEN_CACHE.pop(key, None)
+        abort(404)
+    return Response(data, mimetype="image/jpeg", headers={"Cache-Control": "no-cache"})
 
 
 def pkg_collage(fids, size=1080):
@@ -6357,17 +6405,17 @@ def package_view(pid):
 {% if need %}<p class="tag bad" style="display:block;margin-top:14px;padding:10px;text-align:center">Please choose a replacement for the sold-out product above to continue.</p>
 <button class="btn grow block" type="button" disabled style="opacity:.5;margin-top:10px">Choose replacement first</button>
 {% else %}<div class="row" style="margin-top:16px"><button class="btn gold grow">{{ icon('cart') }} Add package to cart</button>
-<button type="button" class="btn wa" data-card="{{ url_for('web.package_card', pid=pkg['id']) }}" data-more="" data-pre="{{ 1 if is_admin else 0 }}" data-text="{{ share_msg }}" onclick="shareCard(this)">Share</button></div>{% endif %}
+<button type="button" class="btn wa" data-card="{{ url_for('web.package_card', pid=pkg['id']) }}" data-more="{{ more }}" data-pre="{{ 1 if is_admin else 0 }}" data-text="{{ share_msg }}" onclick="shareCard(this)">Share</button></div>{% endif %}
 </form>
 <script>
-var PI={{ js_items|tojson }};
-function pu(){var t=0;PI.forEach(function(it){if(!it.base&&!Object.keys(it.fp).length)return;var f=document.querySelector('input[name=fab_'+it.slot+']:checked');var u=f&&it.fp[f.value]!=null?it.fp[f.value]:it.base;t+=Math.round((u||0)*it.q);});
+var PI={{ js_items|tojson }},EXTRA={{ extra }};
+function pu(){var t=EXTRA;PI.forEach(function(it){if(!it.base&&!Object.keys(it.fp).length)return;var f=document.querySelector('input[name=fab_'+it.slot+']:checked');var u=f&&it.fp[f.value]!=null?it.fp[f.value]:it.base;t+=Math.round((u||0)*it.q);});
 var q=parseInt(document.getElementById('pqty').value)||1;q=Math.max(1,Math.min(20,q));document.getElementById('ptotal').textContent='₦'+(t*q).toLocaleString()+(q>1?'  ('+q+' × ₦'+t.toLocaleString()+')':'');}
 function pq(n){var i=document.getElementById('pqty');i.value=Math.max(1,Math.min(20,(parseInt(i.value)||1)+n));pu();}
 document.querySelectorAll('#pf input[type=radio]').forEach(function(r){r.addEventListener('change',pu)});pu();
 document.querySelectorAll('.swap').forEach(function(s){s.addEventListener('change',function(){var u=new URL(location.href);var cur=u.searchParams.getAll('sw').filter(function(x){return x.split('~')[0]!==s.dataset.slot});u.searchParams.delete('sw');cur.forEach(function(x){u.searchParams.append('sw',x)});if(s.value)u.searchParams.append('sw',s.dataset.slot+'~'+s.value);location.href=u.toString();});});
-</script>""", tab="shop", pkg=pkg, items=items, need=need, js_items=js_items, ptext=pkg_price_text(pkg["id"]),
-                share_msg=pkg_share_text(pkg))
+</script>""", tab="shop", pkg=pkg, items=items, need=need, js_items=js_items, ptext=pkg_price_text(pkg["id"]), extra=int(pkg["extra"] or 0),
+                share_msg=pkg_share_text(pkg), more=pkg_more(pkg["id"]))
 
 
 def pkg_make_sel(parts):
@@ -6438,8 +6486,18 @@ def pkg_cart_line(key, qty):
         subs.append({"p": p, "qty": s["qty"], "qty_all": s["qty"] * qty, "price": price, "each": each, "line_all": all_, "color": color,
                      "fab": fab, "fab_name": FABRIC_NAME.get(fab, ""), "unit": UNIT_WORD.get(fab, "") if is_unit_key(fab) else "",
                      "gone": bool(p["sold_out"])})
-    one = sum(x["each"] for x in subs)
-    return {"key": key, "pkg": pkg, "qty": qty, "line": total, "one": one, "subs": subs, "p": None, "step": 1}
+    # The extra amount is hidden inside the product prices (shared out in proportion), so customers only ever see money.
+    extra = int(pkg["extra"] or 0)
+    if extra and subs:
+        pool, base = extra * qty, sum(x["line_all"] for x in subs)
+        given = 0
+        for n, x in enumerate(subs):
+            share = (pool - given) if n == len(subs) - 1 else int(round(pool * (x["line_all"] / base if base else 1 / len(subs))))
+            given += share
+            x["line_all"] += share
+            x["price"] = x["line_all"] / x["qty_all"] if x["qty_all"] else x["price"]
+            x["each"] = int(round(x["line_all"] / qty))
+    return {"key": key, "pkg": pkg, "qty": qty, "line": total + extra * qty, "one": sum(x["each"] for x in subs), "subs": subs, "p": None, "step": 1}
 
 
 # ---------------------------------------------------------------- admin
@@ -6493,11 +6551,12 @@ def admin_package(pid):
     rdy = social_ready()
     sh = to_int(request.args.get("n"), 0) or 0
     return admin_page("Package " + pkg["name"], """<p><a href="{{ url_for('web.admin_packages') }}">‹ Packages</a></p>
-<h2>📦 {{ pkg['name'] }}</h2><p class="mut small">Customers pay: <b>{{ ptext }}</b> (added up from the products' own prices).</p>
+<h2>📦 {{ pkg['name'] }}</h2><p class="mut small">Products total: <b>{{ money(base) }}{{ '' if base==basehi else ' to ' ~ money(basehi) }}</b>{% if pkg['extra'] %} + extra <b>{{ money(pkg['extra']) }}</b>{% endif %}<br>Customers pay: <b>{{ ptext }}</b></p>
 <form method="post" action="{{ url_for('web.admin_package_save', pid=pkg['id']) }}" class="card" style="padding:14px"><input type="hidden" name="csrf" value="{{ csrf }}">
 <label class="l">Name</label><input name="name" value="{{ pkg['name'] }}" required maxlength="80">
 <label class="l">Group</label><input name="grp" value="{{ pkg['grp'] }}" list="grps" maxlength="40"><datalist id="grps">{% for g in groups %}<option value="{{ g }}">{% endfor %}</datalist>
 <label class="l">Short description (optional)</label><textarea name="description" rows="2" maxlength="300">{{ pkg['description'] }}</textarea>
+<label class="l">Extra amount (₦), added on top of the products' total</label><input name="extra" value="{{ pkg['extra'] or 0 }}" inputmode="numeric" pattern="[0-9]*" maxlength="9">
 <label class="opt"><input type="checkbox" name="active" value="1" {{ 'checked' if pkg['active'] }}><span class="grow"><b>Show this package in the shop</b></span></label>
 <p><button class="btn gold">Save</button></p></form>
 <h3 style="margin-top:16px">Products inside ({{ slots|length }})</h3>
@@ -6515,15 +6574,16 @@ def admin_package(pid):
 {% if (cat or q) and not pool %}<p class="mut">Nothing found.</p>{% endif %}
 <h3 style="margin-top:18px">📣 Share this package</h3>
 <div class="card" style="padding:12px"><b>🟢 WhatsApp</b><p class="mut small" style="margin:4px 0 8px">Sends the picture with the items and the price. Choose a chat, a group, or <b>My status</b>.</p>
-<button type="button" class="btn wa sm" data-card="{{ url_for('web.package_card', pid=pkg['id']) }}" data-more="" data-pre="1" data-text="{{ wa }}" onclick="shareCard(this)">Share picture on WhatsApp / Status</button></div>
+<button type="button" class="btn wa sm" data-card="{{ url_for('web.package_card', pid=pkg['id']) }}" data-more="{{ more }}" data-pre="1" data-text="{{ wa }}" onclick="shareCard(this)">Share picture on WhatsApp / Status</button></div>
 <form method="post" action="{{ url_for('web.admin_package_share', pid=pkg['id']) }}" class="card" style="padding:14px;margin-top:10px"><input type="hidden" name="csrf" value="{{ csrf }}">
 {% if rdy.fb %}<label class="l"><input type="checkbox" name="do_fb" value="1" checked> Facebook Page</label><textarea name="cap_fb" rows="7">{{ cap_fb }}</textarea>{% endif %}
 <label class="l" style="margin-top:10px"><input type="checkbox" name="do_ig" value="1" {{ 'checked' if rdy.ig else 'disabled' }}> Instagram {{ '' if rdy.ig else '(not connected)' }}</label><textarea name="cap_ig" rows="9">{{ cap_ig }}</textarea>
-<div class="row" style="margin-top:10px"><button class="btn gold">📣 Post now</button><a class="btn alt" href="{{ url_for('web.admin_package', pid=pkg['id'], n=shn+1) }}">🔄 New caption</a></div>
+<div class="row" style="margin-top:10px"><button class="btn gold">📣 Post now</button><a class="btn alt" href="{{ url_for('web.admin_package', pid=pkg['id'], n=shn+1) }}">🔄 New caption</a>
+<a class="btn alt" href="{{ url_for('web.admin_package_reel', pid=pkg['id']) }}">🎬 As a Reel</a></div>
 <p class="mut small">Only when you tap Post. Packages never go out automatically.</p></form>
 <form method="post" action="{{ url_for('web.admin_package_delete', pid=pkg['id']) }}" style="margin-top:14px" onsubmit="return confirm('Delete this package?')"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn alt sm">🗑 Delete package</button></form>""",
                       pkg=pkg, slots=slots, cats=cats(), cat=cat, q=q, pool=pool, have=have, groups=_pkg_groups(), ptext=pkg_price_text(pid),
-                      rdy=rdy, shn=sh, wa=pkg_share_text(pkg), cap_fb=pkg_caption(pkg, "fb", sh), cap_ig=pkg_caption(pkg, "ig", sh))
+                      rdy=rdy, shn=sh, wa=pkg_share_text(pkg), more=pkg_more(pid), base=pkg_range(pid)[0]-int(pkg['extra'] or 0), basehi=pkg_range(pid)[1]-int(pkg['extra'] or 0), cap_fb=pkg_caption(pkg, "fb", sh), cap_ig=pkg_caption(pkg, "ig", sh))
 
 
 @bp.post("/admin/package/<pid>/save")
@@ -6535,9 +6595,10 @@ def admin_package_save(pid):
     if not name:
         flash("The package needs a name.")
         return redirect(url_for("web.admin_package", pid=pid))
-    db().execute("UPDATE packages SET name=?, grp=?, description=?, active=? WHERE id=?",
+    extra = to_int(re.sub(r"[^\d]", "", request.form.get("extra", "") or ""), 0, 0, 100_000_000) or 0
+    db().execute("UPDATE packages SET name=?, grp=?, description=?, active=?, extra=? WHERE id=?",
                  (name, request.form.get("grp", "").strip()[:40], request.form.get("description", "").strip()[:300],
-                  1 if request.form.get("active") else 0, pid))
+                  1 if request.form.get("active") else 0, extra, pid))
     db().commit()
     flash("Saved.")
     return redirect(url_for("web.admin_package", pid=pid))
@@ -6609,16 +6670,21 @@ def pkg_pub_url(pid):
 def do_share_package(pkg, want, caps):
     rdy, out, label_of = social_ready(), [], {"fb": "Facebook", "ig": "Instagram"}
     url = pkg_pub_url(pkg["id"])
+    fids = pkg_photo_fids(pkg["id"], 9)
     for plat, fn in (("fb", post_facebook), ("ig", post_instagram)):
         if plat not in want or not rdy[plat]:
             continue
         label = label_of[plat]
         caption = ((caps or {}).get(plat) or "").strip() or pkg_caption(pkg, plat)
         try:
-            rid = fn([url], caption[:2100])
+            with _share_tmp():                       # every product picture ready first, so the download is quick
+                for f in fids:
+                    fetch_file(f)
+            urls = [url] + [pub_img_url(f, fit=(plat == "ig")) for f in fids]
+            rid = fn(urls, caption[:2100])
             db().execute("INSERT INTO social_posts(product_id,platform,status,remote_id,caption,auto) VALUES(?,?,?,?,?,0)",
                          ("pkg:" + pkg["id"], label, "ok", str(rid), caption[:2100]))
-            out.append(f"✅ Posted to {label}")
+            out.append(f"✅ Posted to {label} (cover + {len(fids)} product pictures)")
         except Exception as e:
             db().execute("INSERT INTO social_posts(product_id,platform,status,error,auto) VALUES(?,?,?,?,0)",
                          ("pkg:" + pkg["id"], label, "failed", str(e)[:300]))
@@ -6646,3 +6712,159 @@ def admin_package_share(pid):
     else:
         flash("📤 Sending in the background. You can leave this page. We will notify you when it is done.")
     return redirect(url_for("web.admin_share"))
+
+
+# ---------------------------------------------------------------- package Reel (only when he taps)
+def _scene_intro_package(name):
+    from PIL import ImageDraw
+    bg = _scene_intro()
+    d = ImageDraw.Draw(bg)
+    _pill(d, "PACKAGE", _font(56), REEL_W / 2, 300)
+    nm, f = _reel_text(name) or "Package", _font(54)
+    while d.textlength(nm, font=f) > REEL_W - 120 and len(nm) > 8:
+        nm = nm[:-2]
+    _centered(d, nm, f, 1420, REEL_GOLD)
+    return bg
+
+
+def _scene_outro_package(price_text, wa):
+    from PIL import ImageDraw
+    bg = _gradient()
+    d = ImageDraw.Draw(bg)
+    lg = _reel_logo(340)
+    if lg:
+        d.ellipse((REEL_W / 2 - 192, 260, REEL_W / 2 + 192, 644), outline=REEL_GOLD, width=6)
+        bg.paste(lg, ((REEL_W - 340) // 2, 282), lg)
+    _centered(d, "THE FULL PACKAGE", _font(60), 760, (235, 235, 235))
+    _centered(d, price_text, _font(118), 860, REEL_GOLD)
+    f2 = _font(46, bold=False)
+    _centered(d, "Tap the link in our bio to order", f2, 1090, (235, 235, 235))
+    if wa:
+        _centered(d, f"WhatsApp {wa}", f2, 1156, (235, 235, 235))
+    _pill(d, "Order the package", _font(48), REEL_W / 2, 1300)
+    _centered(d, REEL_CLOSING, _font(40), 1700, REEL_GOLD)
+    _centered(d, REEL_PLACE, _font(32, bold=False), 1790, (170, 170, 170))
+    return bg
+
+
+def make_package_reel(pkg):
+    """One video of the package: intro, each product, then the package price and how to order. Made on the spot."""
+    ff = _ffmpeg()
+    if not ff:
+        raise ReelError("The video tool (FFmpeg) is not installed on the server.")
+    wa, items = CFG.get("WHATSAPP", ""), []
+    with _share_tmp():
+        for s in pkg_slots(pkg["id"]):
+            p = db().execute("SELECT * FROM products WHERE id=? AND active=1", (s["product_id"],)).fetchone()
+            ph = reel_items(s["product_id"]) if p else []
+            pth = fetch_file(ph[0]["file_id"]) if ph else None
+            if pth:
+                items.append({"p": p, "path": pth, "fid": ph[0]["file_id"], "qty": s["qty"]})
+            if len(items) >= 9:
+                break
+    if not items:
+        raise ReelError("None of the products in this package has a picture to show.")
+    ptxt = pkg_price_text(pkg["id"])
+    sig = [(i["p"]["id"], _reel_text(i["p"]["name"]), repr(reel_prices(i["p"])), i["fid"], i["qty"]) for i in items]
+    key = hashlib.sha256("|".join([REEL_DESIGN, "pkg", pkg["id"], pkg["name"], ptxt, repr(sig), setting("web_logo"), wa]).encode()).hexdigest()[:12]
+    out = os.path.join(_reel_dir(), f"pkg_{key}.mp4")
+    if os.path.exists(out) and os.path.getsize(out) > 10000:
+        return out
+    each = min(GEN_PER_PRODUCT_S, (REEL_MAX_SECONDS - GEN_INTRO_S - GEN_OUTRO_S) / len(items))
+    work = os.path.join(_reel_dir(), f"tmp_{key}_{secrets.token_hex(3)}")
+    os.makedirs(work, exist_ok=True)
+    tmp_out = os.path.join(work, "out.mp4")
+    try:
+        import gc
+        files, durs, fades = [], [], []
+
+        def add(im, d, fade):
+            f = os.path.join(work, f"s{len(files)}.png")
+            im.save(f)
+            im.close()
+            files.append(f)
+            durs.append(d)
+            fades.append(fade)
+        add(_scene_intro_package(pkg["name"]), GEN_INTRO_S, "black")
+        for n, it in enumerate(items):
+            p = it["p"]
+            src = _load(it["path"])
+            rows = reel_prices(p)
+            nums = list(fabric_prices(p["id"]).values()) or ([p["price"]] if p["price"] else [])
+            nm = _reel_text(p["name"]) or "Product"
+            im = _scene_hero(src, nm, rows, nums, "", True) if src.width / src.height < 0.72 else _scene_frame(src, nm, rows, nums, "", True)
+            src.close()
+            add(im, each, "0xD4A94A" if n % 2 == 1 else "black")
+            gc.collect()
+        add(_scene_outro_package(ptxt, wa), GEN_OUTRO_S, "black")
+        total = sum(durs)
+        wav = os.path.join(work, "music.wav")
+        make_music("bold", total, int(key[:8], 16), wav)
+        _encode_video(ff, work, files, durs, fades, wav, total, tmp_out)
+        if not os.path.exists(tmp_out) or os.path.getsize(tmp_out) < 10000:
+            raise ReelError("Video maker error: the video file was not created.")
+        os.replace(tmp_out, out)
+    finally:
+        import shutil
+        shutil.rmtree(work, ignore_errors=True)
+    purge_reels(keep=out)
+    return out
+
+
+def do_package_reel(pkg, want, caps=None):
+    rdy, caps, out, info = social_ready(), caps or {}, [], {}
+    path = make_package_reel(pkg)
+    first = next((s["product_id"] for s in pkg_slots(pkg["id"])), None)
+    cover_url, cover_bytes = _reel_cover(first) if first else (None, None)
+    url = pub_vid_url(path)
+    try:
+        for plat in ("fb", "ig"):
+            if plat not in want or not rdy[plat]:
+                continue
+            label = "Facebook" if plat == "fb" else "Instagram"
+            caption = (caps.get(plat) or "").strip() or pkg_caption(pkg, plat)
+            try:
+                if plat == "fb":
+                    rid = post_facebook_reel(url, caption[:2100], info, cover_bytes)
+                else:
+                    rid = post_instagram_reel(url, caption[:2100], cover_url)
+                db().execute("INSERT INTO social_posts(product_id,platform,status,remote_id,caption,auto) VALUES(?,?,?,?,?,0)",
+                             ("pkg:" + pkg["id"], label, "ok", str(rid), caption[:2100]))
+                out.append(f"✅ Posted the package Reel to {label}")
+            except Exception as e:
+                db().execute("INSERT INTO social_posts(product_id,platform,status,error,auto) VALUES(?,?,?,?,0)",
+                             ("pkg:" + pkg["id"], label, "failed", ("Reel: " + str(e))[:300]))
+                out.append(f"❌ {label} package Reel failed: {e}")
+            db().commit()
+    finally:
+        _discard_video(path, delay=900 if info.get("late_fetch") else 0)
+    return out
+
+
+@bp.route("/admin/package/<pid>/reel", methods=["GET", "POST"])
+@admin_required
+def admin_package_reel(pid):
+    pkg = pkg_get(pid, active_only=False)
+    if not pkg:
+        abort(404)
+    if request.method == "POST":
+        rdy = social_ready()
+        want = [pl for pl in ("fb", "ig") if setting("auto_" + pl, "1") == "1" and rdy[pl]]
+        if not want:
+            flash("Connect Facebook or Instagram first.")
+        elif queue_job("pkgreel", "pkg:" + pid, want, [], {}) is None:
+            flash("This Reel is already being sent. Please wait a moment.")
+        else:
+            flash("📤 Sending the package Reel in the background. You can leave the app. We will notify you when it is done.")
+        return redirect(url_for("web.admin_share"))
+    try:
+        path = make_package_reel(pkg)
+    except ReelError as e:
+        flash(f"Could not make the video: {e}")
+        return redirect(url_for("web.admin_package", pid=pid))
+    return admin_page("Share package Reel", """<p><a href="{{ url_for('web.admin_package', pid=pkg['id']) }}">‹ {{ pkg['name'] }}</a></p>
+<h2>🎬 {{ pkg['name'] }}</h2>
+<video src="{{ url_for('web.admin_reelfile', name=name) }}" controls playsinline preload="metadata" style="width:100%;max-width:340px;border-radius:14px;background:#000"></video>
+<p class="mut small">Every product in the package, then the package price. This is exactly what will be posted. It goes out only when you tap the button.</p>
+<form method="post"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn gold">📣 Post it now</button></form>""",
+                      pkg=pkg, name=os.path.basename(path))
