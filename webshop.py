@@ -2552,13 +2552,15 @@ def news_comment_delete(cid):
 
 
 # ================================================================== ADMIN (manage everything inside the app)
-ADMIN_NAV = """<div class="pills" style="margin-bottom:6px">
+ADMIN_NAV = """{% if meta_bad %}<a href="{{ url_for('web.admin_share_connect') }}" style="display:block;margin:0 0 10px;padding:10px 12px;border-radius:12px;background:#fdecea;color:#b3261e;text-decoration:none;font-size:14px"><b>⚠️ Facebook login expired.</b> Posting is paused until you reconnect. Tap here and paste a new token.</a>{% endif %}
+<div class="pills" style="margin-bottom:6px">
 {% for ep,label in [('web.admin_home','Dashboard'),('web.admin_orders','Orders'),('web.admin_products','Products'),('web.admin_packages','📦 Packages'),('web.admin_categories','Categories'),('web.admin_colors','Colours'),('web.admin_news','News'),('web.admin_settings','Settings'),('web.admin_customers','Customers'),('web.admin_share','📣 Share'),('web.qr_page','📲 QR'),('web.admin_thanks','💛 Thank you'),('web.admin_pin_change','🔐 PIN')] %}
 <a class="pill {{ 'on' if request.endpoint==ep }}" href="{{ url_for(ep) }}">{{ label }}</a>{% endfor %}</div>"""
 
 
 def admin_page(title, body, **ctx):
     tab = "share" if title.startswith(("Share", "Reel", "Connect")) else "admin"
+    ctx.setdefault("meta_bad", _meta_bad())
     return page(title, ADMIN_NAV + body, tab=tab, **ctx)
 
 
@@ -3452,15 +3454,65 @@ def _graph(method, path, params, base=None):
     req = urllib.request.Request((base or GRAPH) + path + ("?" + data if method == "GET" else ""),
                                  data=None if method == "GET" else data.encode(), method=method)
     try:
-        return json.loads(urllib.request.urlopen(req, timeout=40).read() or b"{}")
+        out = json.loads(urllib.request.urlopen(req, timeout=40).read() or b"{}")
+        if method == "POST":
+            _meta_login_ok()
+        return out
     except urllib.error.HTTPError as e:
+        code = None
         try:
-            msg = json.loads(e.read() or b"{}").get("error", {}).get("message")
+            err = json.loads(e.read() or b"{}").get("error", {})
+            msg, code = err.get("message"), err.get("code")
         except Exception:
             msg = None
+        low = (msg or "").lower()
+        if code == 190 or "access token" in low or "session has been invalidated" in low:
+            _meta_login_bad(msg or "")
         raise RuntimeError(msg or f"Meta answered HTTP {e.code}")
     except Exception as e:
         raise RuntimeError(str(e) or "Could not reach Facebook")
+
+
+def _meta_login_bad(msg):
+    """Facebook cancelled the login. Remember it (the admin screens show a red notice) and tell the admin, at most every 6 hours."""
+    try:
+        prev = setting("meta_login_bad", "")
+        set_setting("meta_login_bad", f"{int(time.time())}|{msg[:140]}")
+        if not prev or time.time() - (to_int(prev.split("|")[0], 0) or 0) > 6 * 3600:
+            push_admins("⚠️ Facebook login expired", "Open Share, then Connect, and paste a new token to post again.", url="/admin/share/connect", tag="metalogin")
+    except Exception:
+        pass
+
+
+def _meta_classify(msg):
+    """Which box is wrong, from Facebook's own words: 'app_id', 'secret', 'token' or '' when unclear."""
+    m = (msg or "").lower()
+    if "application id" in m or "app id" in m or "invalid application" in m or "app_id" in m:
+        return "app_id"
+    if "client secret" in m or "app secret" in m or "secret" in m or "appsecret" in m:
+        return "secret"
+    if "access token" in m or "oauth" in m or "session" in m or "token" in m:
+        return "token"
+    return ""
+
+
+def _meta_login_ok():
+    try:
+        if setting("meta_login_bad", ""):
+            set_setting("meta_login_bad", "")
+    except Exception:
+        pass
+
+
+def _meta_bad():
+    v = setting("meta_login_bad", "") if has_request_context() else ""
+    return v.split("|", 1)[1] if "|" in v else ("" if not v else "login expired")
+
+
+def _meta_app():
+    """(App ID, App Secret): from Railway variables if set there, else the ones saved in the app. Never shown on any page."""
+    return ((os.environ.get("META_APP_ID") or setting("meta_app_id", "") or "").strip(),
+            (os.environ.get("META_APP_SECRET") or setting("meta_app_secret", "") or "").strip())
 
 
 def social_ready():
@@ -4599,18 +4651,48 @@ def admin_share_connect():
                 if not igid:
                     raise RuntimeError("Instagram did not return your account. Check the token.")
                 set_setting("meta_ig_token", tok)
+                _meta_login_ok()
                 set_setting("meta_ig_token_at", time.time())
                 set_setting("meta_ig_id", igid)
                 set_setting("meta_ig_name", me.get("username", ""))
                 flash(f"Instagram connected: @{me.get('username', '')}")
                 return redirect(url_for("web.admin_share"))
-            app_id, secret = request.form.get("app_id", "").strip(), request.form.get("app_secret", "").strip()
-            tok = request.form.get("user_token", "").strip()
-            if not (app_id and secret and tok):
-                raise RuntimeError("Please fill in all three boxes.")
-            lt = _graph("GET", "/oauth/access_token", {"grant_type": "fb_exchange_token", "client_id": app_id,
-                                                         "client_secret": secret, "fb_exchange_token": tok})["access_token"]
-            acc = _graph("GET", "/me/accounts", {"access_token": lt, "fields": "id,name,access_token", "limit": 25}).get("data", [])
+            known_id, known_secret = _meta_app()
+            if request.form.get("act") == "fix":                   # one corrected box, the other two come from the last try
+                try:
+                    tmp = json.loads(setting("meta_fix_tmp", "{}") or "{}")
+                except ValueError:
+                    tmp = {}
+                val = request.form.get("value", "").strip()
+                key = {"app_id": "app_id", "secret": "secret", "token": "tok"}.get(request.form.get("field", ""))
+                if not tmp or not key or not val:
+                    flash("Please enter it again.")
+                    return redirect(url_for("web.admin_share_connect"))
+                tmp[key] = val
+                app_id, secret, tok = tmp.get("app_id", ""), tmp.get("secret", ""), tmp.get("tok", "")
+            else:
+                app_id = request.form.get("app_id", "").strip() or known_id
+                secret = request.form.get("app_secret", "").strip() or known_secret
+                tok = request.form.get("user_token", "").strip()
+            if not tok:
+                raise RuntimeError("Please paste the new access token.")
+            if not (app_id and secret):
+                raise RuntimeError("Please fill in the App ID and the App Secret (only needed this once).")
+            try:
+                lt = _graph("GET", "/oauth/access_token", {"grant_type": "fb_exchange_token", "client_id": app_id,
+                                                             "client_secret": secret, "fb_exchange_token": tok})["access_token"]
+                acc = _graph("GET", "/me/accounts", {"access_token": lt, "fields": "id,name,access_token", "limit": 25}).get("data", [])
+            except RuntimeError as e:
+                bad = _meta_classify(str(e))
+                if bad:                                            # tell exactly which box is wrong and ask for only that one
+                    set_setting("meta_fix_tmp", json.dumps({"app_id": app_id, "secret": secret, "tok": tok, "field": bad,
+                                                            "err": str(e)[:220], "t": time.time()}))
+                    return redirect(url_for("web.admin_share_connect"))
+                raise
+            set_setting("meta_fix_tmp", "")
+            if not os.environ.get("META_APP_ID") and (app_id != known_id or secret != known_secret):
+                set_setting("meta_app_id", app_id)                 # remembered, so next time only the token is needed
+                set_setting("meta_app_secret", secret)
             if not acc:
                 raise RuntimeError("No Facebook Page found for this login. Make sure you are an admin of the page and allowed it in the permissions.")
             if len(acc) == 1:
@@ -4622,13 +4704,41 @@ def admin_share_connect():
         except RuntimeError as e:
             flash(f"Could not connect: {e}")
             return redirect(url_for("web.admin_share_connect"))
+    fix = {}
+    if request.args.get("reset"):
+        set_setting("meta_fix_tmp", "")
+    else:
+        try:
+            fix = json.loads(setting("meta_fix_tmp", "") or "{}")
+        except ValueError:
+            fix = {}
+        if fix and time.time() - (fix.get("t") or 0) > 1800:
+            fix = {}
     return admin_page("Connect", """<p><a href="{{ url_for('web.admin_share') }}">‹ Back</a></p><h2>Connect Facebook &amp; Instagram</h2>
-{% if pages %}<form method="post" class="card" style="padding:14px"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="act" value="choose">
+{% if fix %}<form method="post" class="card" style="padding:14px"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="act" value="fix"><input type="hidden" name="field" value="{{ fix['field'] }}">
+<div style="padding:10px;border-radius:12px;background:#fdecea;color:#b3261e;font-size:14px;margin-bottom:10px"><b>Facebook says:</b> {{ fix['err'] }}</div>
+<h3 style="margin:0 0 6px">{{ {'app_id':'The App ID is not correct','secret':'The App Secret is not correct','token':'The access token is not valid (it may have expired)'}[fix['field']] }}</h3>
+<p class="mut small" style="margin-top:0">Only this one needs fixing. The other two are kept from your last try.{% if env_set %} <b>Note:</b> a Railway variable for this is set, so change it in Railway as well, or the app will use the Railway one next time.{% endif %}</p>
+<label class="l">{{ {'app_id':'App ID','secret':'App Secret','token':'New access token (generate again in the Graph API Explorer)'}[fix['field']] }}</label>
+{% if fix['field']=='token' %}<textarea name="value" rows="3" required autocomplete="off"></textarea>{% else %}<input name="value" {{ 'type=password' if fix['field']=='secret' }} required autocomplete="off">{% endif %}
+<p><button class="btn gold">Save and connect</button> <a class="btn alt" href="{{ url_for('web.admin_share_connect', reset=1) }}">Start over</a></p></form>
+{% elif pages %}<form method="post" class="card" style="padding:14px"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="act" value="choose">
 <label class="l">Which page is your brand page?</label>{% for pg in pages %}<label class="l"><input type="radio" name="page" value="{{ pg['id'] }}" required> {{ pg['name'] }}</label>{% endfor %}
 <p><button class="btn gold">Use this page</button></p></form>
+{% elif known %}<form method="post" class="card" style="padding:14px"><input type="hidden" name="csrf" value="{{ csrf }}">
+<h3 style="margin-top:0">Reconnect Facebook &amp; Instagram <span class="tag g">only the token</span></h3>
+<p class="mut small">Your app is remembered (App ID ending <b>{{ known[-4:] }}</b>). In the Graph API Explorer choose your app, tap Generate Access Token, then paste it here.</p>
+<label class="l">New access token</label><textarea name="user_token" rows="3" required autocomplete="off"></textarea>
+<p><button class="btn gold">Reconnect</button></p></form>
+<details style="margin-top:14px"><summary class="mut small">Use a different App ID or App Secret</summary>
+<form method="post" class="card" style="padding:14px;margin-top:8px"><input type="hidden" name="csrf" value="{{ csrf }}">
+<label class="l">App ID</label><input name="app_id" required autocomplete="off">
+<label class="l">App Secret</label><input name="app_secret" type="password" required autocomplete="off">
+<label class="l">Access token</label><textarea name="user_token" rows="3" required autocomplete="off"></textarea>
+<p><button class="btn gold">Connect with these</button></p></form></details>
 {% else %}<form method="post" class="card" style="padding:14px"><input type="hidden" name="csrf" value="{{ csrf }}">
 <h3 style="margin-top:0">Facebook Page + Instagram <span class="tag g">recommended</span></h3>
-<p class="mut small">One connection posts to your Facebook Page and to the Instagram account linked to it. Your App Secret is used once and is not saved.</p>
+<p class="mut small">One connection posts to your Facebook Page and to the Instagram account linked to it. The App ID and App Secret are remembered after this first time, so later you only paste a new token. The secret is never shown again.</p>
 <label class="l">App ID</label><input name="app_id" required autocomplete="off">
 <label class="l">App Secret</label><input name="app_secret" type="password" required autocomplete="off">
 <label class="l">Access token (from Graph API Explorer)</label><textarea name="user_token" rows="3" required autocomplete="off"></textarea>
@@ -4637,10 +4747,12 @@ def admin_share_connect():
 <form method="post" class="card" style="padding:14px;margin-top:8px"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="act" value="igonly">
 <p class="mut small">Paste the Instagram access token from the Meta developer dashboard (Instagram, API setup with Instagram login, Generate token). It renews itself.</p>
 <label class="l">Instagram access token</label><textarea name="ig_token" rows="3" required autocomplete="off"></textarea>
-<p><button class="btn gold">Connect Instagram</button></p></form></details>{% endif %}""", pages=pages)
+<p><button class="btn gold">Connect Instagram</button></p></form></details>{% endif %}""", pages=pages, known=_meta_app()[0] if all(_meta_app()) else "", fix=fix,
+                      env_set=bool(fix and os.environ.get({"app_id": "META_APP_ID", "secret": "META_APP_SECRET"}.get(fix.get("field"), "_none_"))))
 
 
 def _finish_connect(pg):
+    _meta_login_ok()
     set_setting("meta_page_token", pg["access_token"])
     set_setting("meta_fb_page_id", pg["id"])
     set_setting("meta_page_name", pg.get("name", ""))
