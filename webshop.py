@@ -4639,7 +4639,8 @@ def admin_share_connect():
                 pick = next((x for x in pages if x["id"] == request.form.get("page")), None)
                 if not pick:
                     raise RuntimeError("Please choose a page.")
-                _finish_connect(pick)
+                _finish_connect(pick, setting("meta_pages_ut", ""))
+                set_setting("meta_pages_ut", "")
                 flash(f"Connected to {pick['name']}.")
                 return redirect(url_for("web.admin_share"))
             if request.form.get("act") == "igonly":
@@ -4681,7 +4682,10 @@ def admin_share_connect():
             try:
                 lt = _graph("GET", "/oauth/access_token", {"grant_type": "fb_exchange_token", "client_id": app_id,
                                                              "client_secret": secret, "fb_exchange_token": tok})["access_token"]
-                acc = _graph("GET", "/me/accounts", {"access_token": lt, "fields": "id,name,access_token", "limit": 25}).get("data", [])
+                try:
+                    acc = _graph("GET", "/me/accounts", {"access_token": lt, "fields": "id,name,access_token,instagram_business_account{id,username}", "limit": 25}).get("data", [])
+                except RuntimeError:                               # some logins refuse the Instagram field: ask again without it
+                    acc = _graph("GET", "/me/accounts", {"access_token": lt, "fields": "id,name,access_token", "limit": 25}).get("data", [])
             except RuntimeError as e:
                 bad = _meta_classify(str(e))
                 if bad:                                            # tell exactly which box is wrong and ask for only that one
@@ -4696,10 +4700,11 @@ def admin_share_connect():
             if not acc:
                 raise RuntimeError("No Facebook Page found for this login. Make sure you are an admin of the page and allowed it in the permissions.")
             if len(acc) == 1:
-                _finish_connect(acc[0])
+                _finish_connect(acc[0], lt)
                 flash(f"Connected to {acc[0]['name']}.")
                 return redirect(url_for("web.admin_share"))
             set_setting("meta_pages_tmp", json.dumps(acc))
+            set_setting("meta_pages_ut", lt)
             return redirect(url_for("web.admin_share_connect"))
         except RuntimeError as e:
             flash(f"Could not connect: {e}")
@@ -4751,23 +4756,40 @@ def admin_share_connect():
                       env_set=bool(fix and os.environ.get({"app_id": "META_APP_ID", "secret": "META_APP_SECRET"}.get(fix.get("field"), "_none_"))))
 
 
-def _finish_connect(pg):
+def _finish_connect(pg, user_token=""):
+    """Save the page login and find the Instagram account linked to it. Never wipes a working Instagram connection."""
     _meta_login_ok()
     set_setting("meta_page_token", pg["access_token"])
     set_setting("meta_fb_page_id", pg["id"])
     set_setting("meta_page_name", pg.get("name", ""))
-    ig_id, ig_name = "", ""
-    try:
-        d = _graph("GET", f"/{pg['id']}", {"fields": "instagram_business_account{id,username}", "access_token": pg["access_token"]})
-        ig = d.get("instagram_business_account") or {}
-        ig_id, ig_name = ig.get("id", ""), ig.get("username", "")
-    except RuntimeError:
-        pass
-    set_setting("meta_ig_id", ig_id)
-    set_setting("meta_ig_name", ig_name)
+    ig_id, ig_name, why = "", "", ""
+    ig = pg.get("instagram_business_account") or {}
+    if ig.get("id"):
+        ig_id, ig_name = ig["id"], ig.get("username", "")
+    tries = [("instagram_business_account{id,username}", pg["access_token"]),
+             ("connected_instagram_account{id,username}", pg["access_token"])]
+    if user_token:
+        tries += [("instagram_business_account{id,username}", user_token), ("connected_instagram_account{id,username}", user_token)]
+    for field, tk_ in tries:
+        if ig_id:
+            break
+        try:
+            d = _graph("GET", f"/{pg['id']}", {"fields": field, "access_token": tk_})
+            ig = d.get("instagram_business_account") or d.get("connected_instagram_account") or {}
+            if ig.get("id"):
+                ig_id, ig_name = ig["id"], ig.get("username", "")
+        except RuntimeError as e:
+            why = str(e)[:200]
     set_setting("meta_pages_tmp", "[]")
-    if not ig_id:
-        flash("Facebook is connected, but no Instagram Business account is linked to this page yet.")
+    if ig_id:
+        set_setting("meta_ig_id", ig_id)
+        set_setting("meta_ig_name", ig_name)
+        return
+    if setting("meta_ig_id"):                                      # keep the Instagram connection that was already working
+        flash("Facebook is connected. Instagram could not be re-checked just now, so the existing Instagram connection was kept." + (f" ({why})" if why else ""))
+        return
+    flash("Facebook is connected, but Instagram was not found for this page." + (f" Facebook says: {why}" if why else
+          " Make sure the Instagram account is a Business or Creator account linked to this Facebook Page, and that instagram_basic and instagram_content_publish were ticked when you generated the token."))
 
 
 @bp.get("/admin/customers")
