@@ -4017,7 +4017,39 @@ def _ig_publish(ig, cid, tok, base):
     raise last
 
 
+def _ig_heal():
+    """Instagram says the account id does not exist: look it up again through the Facebook Page login and use that route.
+    Returns True when something was corrected, so the post can be tried once more."""
+    pt, pid = setting("meta_page_token"), setting("meta_fb_page_id")
+    if not (pt and pid):
+        return False
+    for field in ("instagram_business_account{id,username}", "connected_instagram_account{id,username}"):
+        try:
+            d = _graph("GET", f"/{pid}", {"fields": field, "access_token": pt})
+        except RuntimeError:
+            continue
+        ig = d.get("instagram_business_account") or d.get("connected_instagram_account") or {}
+        if ig.get("id"):
+            changed = str(ig["id"]) != setting("meta_ig_id") or bool(setting("meta_ig_token"))
+            set_setting("meta_ig_id", str(ig["id"]))
+            set_setting("meta_ig_name", ig.get("username", "") or setting("meta_ig_name"))
+            set_setting("meta_ig_token", "")
+            set_setting("meta_ig_token_at", "")
+            return changed
+    return False
+
+
 def post_instagram(img_urls, caption):
+    try:
+        return _post_instagram(img_urls, caption)
+    except RuntimeError as e:
+        m = str(e).lower()
+        if ("does not exist" in m or "unsupported post request" in m) and _ig_heal():
+            return _post_instagram(img_urls, caption)
+        raise
+
+
+def _post_instagram(img_urls, caption):
     if isinstance(img_urls, str):
         img_urls = [img_urls]
     base, tok = _ig_target()
@@ -4784,6 +4816,8 @@ def _finish_connect(pg, user_token=""):
     if ig_id:
         set_setting("meta_ig_id", ig_id)
         set_setting("meta_ig_name", ig_name)
+        set_setting("meta_ig_token", "")                           # an old Instagram-only token belongs to a different account id
+        set_setting("meta_ig_token_at", "")
         return
     if setting("meta_ig_id"):                                      # keep the Instagram connection that was already working
         flash("Facebook is connected. Instagram could not be re-checked just now, so the existing Instagram connection was kept." + (f" ({why})" if why else ""))
@@ -5731,6 +5765,16 @@ def admin_reelfile(name):
 
 # ---------------------------------------------------------------- posting a Reel
 def post_instagram_reel(video_url, caption, cover_url=None):
+    try:
+        return _post_instagram_reel(video_url, caption, cover_url)
+    except RuntimeError as e:
+        m = str(e).lower()
+        if ("does not exist" in m or "unsupported post request" in m) and _ig_heal():
+            return _post_instagram_reel(video_url, caption, cover_url)
+        raise
+
+
+def _post_instagram_reel(video_url, caption, cover_url=None):
     base, tok = _ig_target()
     ig = setting("meta_ig_id")
     params = {"media_type": "REELS", "video_url": video_url, "caption": caption, "share_to_feed": "true", "access_token": tok}
