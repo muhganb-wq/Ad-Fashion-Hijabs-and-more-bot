@@ -4092,8 +4092,8 @@ def do_share(p, picked, want, caps=None, auto=0):
                 for f in picked:
                     fetch_file(f)
             rid = fn(urls, caption)
-            db().execute("INSERT INTO social_posts(product_id,platform,status,remote_id,caption,auto) VALUES(?,?,?,?,?,?)",
-                         (pid, label, "ok", str(rid), caption, auto))
+            db().execute("INSERT INTO social_posts(product_id,platform,status,remote_id,caption,auto,kind) VALUES(?,?,?,?,?,?,?)",
+                         (pid, label, "ok", str(rid), caption, auto, "swipe" if len(picked) > 1 else "photo"))
             out.append(f"✅ Posted to {label}" + (f" ({len(picked)} photos)" if len(picked) > 1 else ""))
         except Exception as e:
             db().execute("INSERT INTO social_posts(product_id,platform,status,error,auto) VALUES(?,?,?,?,?)",
@@ -4410,6 +4410,7 @@ def auto_tick(flask_app, now=None, sync=None):
                     threading.Thread(target=_run_slot, args=(flask_app, kind, skey), daemon=True, name="auto-" + skey).start()
             if now.minute % 30 == 7:                                       # tidy old bookkeeping
                 _auto_cleanup(now)
+            insights_tick(flask_app)                                       # measure yesterday's posts (own thread, every 20 minutes)
         except Exception as e:
             try:
                 set_setting("auto_err", f"{datetime.now(LAGOS):%d %b %H:%M} tick: {e}"[:300])
@@ -4566,6 +4567,9 @@ def admin_share():
 {% for m in j['msgs'] %}<div class="mut">{{ m }}</div>{% endfor %}</div>{% endfor %}</div>
 {% if busy %}<script>setTimeout(function(){location.reload()},4000);</script>{% endif %}{% endif %}
 <script>(function(){var s0="{{ sig }}";setInterval(function(){fetch("{{ url_for('web.admin_share_pulse') }}",{credentials:"same-origin"}).then(function(r){return r.json()}).then(function(d){if(d.sig!==s0)location.reload()}).catch(function(){})},10000)})();</script>
+<div class="card" style="padding:14px;margin-bottom:12px"><b>📈 Best times</b>
+<p class="small mut" style="margin:6px 0">Which hours and kinds of post reach the most people, with suggestions on which hours to switch off.</p>
+<div class="row"><a class="btn gold sm" href="{{ url_for('web.admin_share_insights') }}">📈 Open best times</a></div></div>
 <div class="card" style="padding:14px;margin-bottom:12px"><b>📦 Packages</b>
 <p class="small mut" style="margin:6px 0">Share a package by hand when you want. Open a package and tap Post.</p>
 <div class="row"><a class="btn gold sm" href="{{ url_for('web.admin_packages') }}">📦 Open packages</a></div></div>
@@ -4765,6 +4769,7 @@ def admin_share_connect():
 {% elif known %}<form method="post" class="card" style="padding:14px"><input type="hidden" name="csrf" value="{{ csrf }}">
 <h3 style="margin-top:0">Reconnect Facebook &amp; Instagram <span class="tag g">only the token</span></h3>
 <p class="mut small">Your app is remembered (App ID ending <b>{{ known[-4:] }}</b>). In the Graph API Explorer choose your app, tap Generate Access Token, then paste it here.</p>
+<p class="mut small">When you generate it, tick these permissions: business_management, instagram_basic, instagram_content_publish, pages_show_list, pages_read_engagement, pages_read_user_content, pages_manage_posts, <b>read_insights</b>, <b>instagram_manage_insights</b>.</p>
 <label class="l">New access token</label><textarea name="user_token" rows="3" required autocomplete="off"></textarea>
 <p><button class="btn gold">Reconnect</button></p></form>
 <details style="margin-top:14px"><summary class="mut small">Use a different App ID or App Secret</summary>
@@ -4894,6 +4899,7 @@ def register(flask_app, cfg):
     CFG.update(cfg)
     init_web_db()
     _pkg_init()
+    _ins_init()
     refresh_fabrics(True)
     # A stable secret key (kept in the database volume) so people stay signed in across redeploys.
     secret = os.environ.get("SECRET_KEY")
@@ -5864,8 +5870,8 @@ def _do_reel(p, url, want, rdy, caps, out, pid, info, auto=0):
                 rid = fn(url, caption[:2100], info, info.get("cover_bytes"))
             else:
                 rid = fn(url, caption[:2100], info.get("cover_url"))
-            db().execute("INSERT INTO social_posts(product_id,platform,status,remote_id,caption,auto) VALUES(?,?,?,?,?,?)",
-                         (pid, label, "ok", str(rid), caption[:2100], auto))
+            db().execute("INSERT INTO social_posts(product_id,platform,status,remote_id,caption,auto,kind) VALUES(?,?,?,?,?,?,?)",
+                         (pid, label, "ok", str(rid), caption[:2100], auto, "reel"))
             out.append(f"✅ Posted Reel to {label}")
         except Exception as e:
             db().execute("INSERT INTO social_posts(product_id,platform,status,error,auto) VALUES(?,?,?,?,?)",
@@ -6155,8 +6161,8 @@ def do_general_reel(want, caps=None, auto=0):
                     rid = post_facebook_reel(url, caption[:2100], info, cover_bytes)
                 else:
                     rid = post_instagram_reel(url, caption[:2100], cover_url)
-                db().execute("INSERT INTO social_posts(product_id,platform,status,remote_id,caption,auto) VALUES(?,?,?,?,?,?)",
-                             ("general", label, "ok", str(rid), caption[:2100], auto))
+                db().execute("INSERT INTO social_posts(product_id,platform,status,remote_id,caption,auto,kind) VALUES(?,?,?,?,?,?,?)",
+                             ("general", label, "ok", str(rid), caption[:2100], auto, "shopreel"))
                 out.append(f"✅ Posted the Shop Reel to {label}")
                 done.append(plat)
                 cur2 = _pending()
@@ -6860,7 +6866,7 @@ def do_share_package(pkg, want, caps):
                     fetch_file(f)
             urls = [url] + [pub_img_url(f, fit=(plat == "ig")) for f in fids]
             rid = fn(urls, caption[:2100])
-            db().execute("INSERT INTO social_posts(product_id,platform,status,remote_id,caption,auto) VALUES(?,?,?,?,?,0)",
+            db().execute("INSERT INTO social_posts(product_id,platform,status,remote_id,caption,auto,kind) VALUES(?,?,?,?,?,0,'package')",
                          ("pkg:" + pkg["id"], label, "ok", str(rid), caption[:2100]))
             out.append(f"✅ Posted to {label} (cover + {len(fids)} product pictures)")
         except Exception as e:
@@ -7006,7 +7012,7 @@ def do_package_reel(pkg, want, caps=None):
                     rid = post_facebook_reel(url, caption[:2100], info, cover_bytes)
                 else:
                     rid = post_instagram_reel(url, caption[:2100], cover_url)
-                db().execute("INSERT INTO social_posts(product_id,platform,status,remote_id,caption,auto) VALUES(?,?,?,?,?,0)",
+                db().execute("INSERT INTO social_posts(product_id,platform,status,remote_id,caption,auto,kind) VALUES(?,?,?,?,?,0,'pkgreel')",
                              ("pkg:" + pkg["id"], label, "ok", str(rid), caption[:2100]))
                 out.append(f"✅ Posted the package Reel to {label}")
             except Exception as e:
@@ -7046,3 +7052,222 @@ def admin_package_reel(pid):
 <p class="mut small">Every product in the package, then the package price. This is exactly what will be posted. It goes out only when you tap the button.</p>
 <form method="post"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn gold">📣 Post it now</button></form>""",
                       pkg=pkg, name=os.path.basename(path))
+
+
+# ================================================================== Best times: which hours and kinds of post reach more people
+INS_GROUPS = {"photo": ("photo", "swipe", "package"), "reel": ("reel", "shopreel", "pkgreel")}
+INS_KIND_NAMES = {"photo": "Single photo", "swipe": "Swipe post", "package": "Package post",
+                  "reel": "Product Reel", "shopreel": "Shop Reel", "pkgreel": "Package Reel", "": "Older posts"}
+INS_MIN_POSTS_PER_HOUR = 3        # an hour needs at least this many measured posts before it is ranked
+INS_MIN_TOTAL = 30                # and the group needs this many in total before anything is suggested
+
+
+def _ins_init():
+    c = sqlite3.connect(CFG["DB"])
+    for col, ddl in (("kind", "TEXT DEFAULT ''"), ("score", "INTEGER DEFAULT -1"), ("basis", "TEXT DEFAULT ''"), ("insight_at", "TEXT DEFAULT ''")):
+        cols = {r[1] for r in c.execute("PRAGMA table_info(social_posts)")}
+        if cols and col not in cols:
+            c.execute(f"ALTER TABLE social_posts ADD COLUMN {col} {ddl}")
+    c.commit()
+    c.close()
+
+
+def _num(v):
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def _insight_value(d):
+    """First numeric value out of a Graph 'insights' answer."""
+    for m in (d or {}).get("data", []):
+        vals = m.get("values") or []
+        if vals and _num(vals[0].get("value")) is not None:
+            return _num(vals[0]["value"])
+        if _num(m.get("total_value", {}).get("value")) is not None:
+            return _num(m["total_value"]["value"])
+    return None
+
+
+def _fb_score(rid):
+    """(score, basis, error). Reach if Facebook allows it, else likes + comments + shares."""
+    tok, err = setting("meta_page_token"), ""
+    for metric in ("post_total_media_view_unique", "post_media_view", "post_impressions_unique"):
+        try:
+            v = _insight_value(_graph("GET", f"/{rid}/insights", {"metric": metric, "access_token": tok}))
+            if v is not None:
+                return v, "reach", ""
+        except RuntimeError as e:
+            err = str(e)[:160]
+    try:
+        d = _graph("GET", f"/{rid}", {"fields": "reactions.summary(true).limit(0),comments.summary(true).limit(0),shares", "access_token": tok})
+        n = (d.get("reactions", {}).get("summary", {}).get("total_count", 0) + d.get("comments", {}).get("summary", {}).get("total_count", 0)
+             + (d.get("shares") or {}).get("count", 0))
+        return n, "engage", err
+    except RuntimeError as e:
+        return None, "", str(e)[:160] or err
+
+
+def _ig_score(rid):
+    base, tok = _ig_target()
+    err = ""
+    for metric in ("reach", "views"):
+        try:
+            v = _insight_value(_graph("GET", f"/{rid}/insights", {"metric": metric, "access_token": tok}, base=base))
+            if v is not None:
+                return v, "reach", ""
+        except RuntimeError as e:
+            err = str(e)[:160]
+    try:
+        d = _graph("GET", f"/{rid}", {"fields": "like_count,comments_count", "access_token": tok}, base=base)
+        return (_num(d.get("like_count")) or 0) + (_num(d.get("comments_count")) or 0), "engage", err
+    except RuntimeError as e:
+        return None, "", str(e)[:160] or err
+
+
+def collect_insights(limit=12):
+    """Measure posts that are at least a day old (once each). Posts older than 14 days are given up on quietly."""
+    db().execute("""UPDATE social_posts SET insight_at='x' WHERE status='ok' AND insight_at='' AND created_at < datetime('now','-14 days')""")
+    rows = db().execute("""SELECT id, platform, remote_id FROM social_posts WHERE status='ok' AND insight_at='' AND remote_id!=''
+                           AND created_at <= datetime('now','-24 hours') ORDER BY id LIMIT ?""", (limit,)).fetchall()
+    done = 0
+    for r in rows:
+        fn = _fb_score if r["platform"] == "Facebook" else _ig_score
+        try:
+            sc, basis, err = fn(r["remote_id"])
+        except Exception as e:
+            sc, basis, err = None, "", str(e)[:160]
+        if sc is None:
+            set_setting("ins_err", (err or "No answer")[:200])
+            db().execute("UPDATE social_posts SET insight_at=? WHERE id=?", (f"t{int(time.time())}", r["id"]))   # try again later (see below)
+        else:
+            db().execute("UPDATE social_posts SET score=?, basis=?, insight_at=datetime('now') WHERE id=?", (sc, basis, r["id"]))
+            done += 1
+            if basis == "reach":
+                set_setting("ins_err", "")
+    # a failed measurement is retried after 6 hours, up to the 14-day limit
+    db().execute("""UPDATE social_posts SET insight_at='' WHERE insight_at LIKE 't%' AND CAST(substr(insight_at,2) AS INTEGER) < ?""",
+                 (int(time.time()) - 6 * 3600,))
+    db().commit()
+    return done
+
+
+_INS_BUSY = threading.Lock()
+
+
+def _ins_background(flask_app):
+    if not _INS_BUSY.acquire(blocking=False):
+        return
+    try:
+        with flask_app.app_context():
+            try:
+                if social_ready()["fb"] or social_ready()["ig"]:
+                    collect_insights()
+            finally:
+                try:
+                    db().close()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    finally:
+        _INS_BUSY.release()
+
+
+def insights_tick(flask_app, now=None):
+    """Called by the clock. Starts a measuring round at most every 20 minutes, in its own thread."""
+    try:
+        last = to_int(setting("ins_last", "0"), 0) or 0
+        if time.time() - last < 1200:
+            return
+        set_setting("ins_last", str(int(time.time())))
+        threading.Thread(target=_ins_background, args=(flask_app,), daemon=True, name="insights").start()
+    except Exception:
+        pass
+
+
+def insights_report():
+    """Ranking per group (photos / reels). Hours are Lagos hours of the posting time."""
+    out = {}
+    for g, kinds in INS_GROUPS.items():
+        q = ",".join("?" * len(kinds))
+        rows = db().execute(f"""SELECT kind, platform, score, basis, created_at FROM social_posts
+                                WHERE status='ok' AND score>=0 AND kind IN ({q}) AND created_at >= datetime('now','-60 days')""", kinds).fetchall()
+        basis = "reach" if sum(1 for r in rows if r["basis"] == "reach") * 2 >= len(rows) else "engage"
+        rows = [r for r in rows if r["basis"] == basis]
+        hours, kinds_s, days = {}, {}, set()
+        for r in rows:
+            try:
+                t = datetime.strptime(r["created_at"][:19], "%Y-%m-%d %H:%M:%S") + timedelta(hours=1)
+            except ValueError:
+                continue
+            days.add(t.date())
+            hours.setdefault(t.hour, []).append(r["score"])
+            kinds_s.setdefault(r["kind"], []).append(r["score"])
+        avg = lambda v: sum(v) / len(v)
+        hl = sorted(({"h": h, "n": len(v), "avg": avg(v)} for h, v in hours.items()), key=lambda x: -x["avg"])
+        ranked = [x for x in hl if x["n"] >= INS_MIN_POSTS_PER_HOUR]
+        kl = sorted(({"kind": k, "name": INS_KIND_NAMES.get(k, k), "n": len(v), "avg": avg(v)} for k, v in kinds_s.items()), key=lambda x: -x["avg"])
+        ready = len(rows) >= INS_MIN_TOTAL and len(days) >= 7 and len(ranked) >= 4
+        overall = avg([r["score"] for r in rows]) if rows else 0
+        on = set(photo_hours() if g == "photo" else reel_hours())
+        best = ranked[:5] if ready else []
+        weak = [x for x in reversed(ranked) if x["avg"] < 0.6 * overall and x["h"] in on][:6] if ready else []
+        out[g] = {"basis": basis, "n": len(rows), "days": len(days), "hours": hl, "kinds": kl, "ready": ready, "best": best, "weak": weak,
+                  "overall": overall, "need": max(0, INS_MIN_TOTAL - len(rows)), "on": on}
+    return out
+
+
+@bp.get("/admin/share/insights")
+@admin_required
+def admin_share_insights():
+    rep = insights_report()
+    pending = db().execute("SELECT COUNT(*) FROM social_posts WHERE status='ok' AND remote_id!='' AND score<0").fetchone()[0]
+    measured = db().execute("SELECT COUNT(*) FROM social_posts WHERE score>=0").fetchone()[0]
+    return admin_page("Share · Best times", """<p><a href="{{ url_for('web.admin_share') }}">‹ Back</a></p><h2>📈 Best times to post</h2>
+<p class="mut small">The app measures every post one day after it goes out, then ranks the hours (Nigeria time) and kinds of post. Measured so far: <b>{{ measured }}</b> · waiting to be measured: <b>{{ pending }}</b>.</p>
+{% if err and not measured %}<div class="card" style="padding:12px;margin-bottom:12px;background:#fdecea;color:#b3261e;font-size:14px"><b>Facebook or Instagram refused the numbers:</b> {{ err }}<br>Reconnect and tick <b>read_insights</b> and <b>instagram_manage_insights</b> when you generate the token.</div>{% endif %}
+{% for g,title,hname in [('photo','📷 Photos and swipe posts','ph'),('reel','🎬 Reels','rl')] %}{% set r = rep[g] %}
+<div class="card" style="padding:14px;margin-bottom:12px"><b>{{ title }}</b>
+<p class="mut small" style="margin:4px 0 8px">{{ r['n'] }} measured posts over {{ r['days'] }} day(s). Score = {{ 'people reached' if r['basis']=='reach' else 'likes + comments + shares (reach was not available)' }}.</p>
+{% if not r['ready'] %}<p class="small">⏳ Still learning. Suggestions start after at least {{ min_total }} measured posts over 7 or more days{% if r['need'] %} (about {{ r['need'] }} more){% endif %}. Until then the numbers below are only a rough hint.</p>{% else %}
+<p class="small" style="margin:0 0 4px"><b>Best hours</b></p>
+{% for x in r['best'] %}<div class="row between small"><span>🥇 {{ '%02d:00'|format(x['h']) }}</span><span class="mut">{{ x['avg']|round|int }} avg · {{ x['n'] }} posts</span></div>{% endfor %}
+{% if r['weak'] %}<p class="small" style="margin:10px 0 4px"><b>Weak hours you could switch off</b> <span class="mut">(clearly below your average of {{ r['overall']|round|int }})</span></p>
+{% for x in r['weak'] %}<form method="post" action="{{ url_for('web.admin_share_insights_off') }}" class="row between small" style="margin:4px 0"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="g" value="{{ g }}"><input type="hidden" name="h" value="{{ x['h'] }}">
+<span>🔻 {{ '%02d:00'|format(x['h']) }} <span class="mut">{{ x['avg']|round|int }} avg · {{ x['n'] }} posts</span></span><button class="btn alt sm">Switch off</button></form>{% endfor %}
+{% else %}<p class="small mut" style="margin-top:10px">No hour is clearly weak right now.</p>{% endif %}{% endif %}
+{% if r['kinds'] %}<p class="small" style="margin:10px 0 4px"><b>By kind of post</b></p>
+{% for k in r['kinds'] %}<div class="row between small"><span>{{ k['name'] }}</span><span class="mut">{{ k['avg']|round|int }} avg · {{ k['n'] }} posts</span></div>{% endfor %}{% endif %}
+{% if r['hours'] %}<details style="margin-top:10px"><summary class="mut small">All hours</summary>{% for x in r['hours'] %}<div class="row between small"><span>{{ '%02d:00'|format(x['h']) }}{% if x['h'] not in r['on'] %} <span class="mut">(switched off)</span>{% endif %}</span><span class="mut">{{ x['avg']|round|int }} avg · {{ x['n'] }} post{{ '' if x['n']==1 else 's' }}{% if x['n'] < min_hour %} · too few{% endif %}</span></div>{% endfor %}</details>{% endif %}
+</div>{% endfor %}
+<p class="mut small">A suggestion is not an order: nothing is switched off unless you tap Switch off. You can switch hours back on in Share, Automatic posting. Posts made before this feature have no measured score; only new posts count.</p>
+<form method="post" action="{{ url_for('web.admin_share_insights_now') }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn alt sm">🔄 Measure now</button></form>""",
+        rep=rep, pending=pending, measured=measured, err=setting("ins_err", ""), min_total=INS_MIN_TOTAL, min_hour=INS_MIN_POSTS_PER_HOUR)
+
+
+@bp.post("/admin/share/insights/off")
+@admin_required
+def admin_share_insights_off():
+    g, h = request.form.get("g", ""), to_int(request.form.get("h", ""), -1)
+    if g == "photo" and h in range(24):
+        key, allowed = "auto_off_hours", list(range(24))
+    elif g == "reel" and h in REEL_HOURS:
+        key, allowed = "auto_reel_off_hours", REEL_HOURS
+    else:
+        return redirect(url_for("web.admin_share_insights"))
+    off = {int(x) for x in (setting(key, "") or "").split(",") if x.strip().isdigit()}
+    off.add(h)
+    set_setting(key, ",".join(str(x) for x in sorted(off)))
+    flash(f"{h:02d}:00 switched off. You can switch it back on in Share.")
+    return redirect(url_for("web.admin_share_insights"))
+
+
+@bp.post("/admin/share/insights/now")
+@admin_required
+def admin_share_insights_now():
+    set_setting("ins_last", str(int(time.time())))
+    threading.Thread(target=_ins_background, args=(current_app._get_current_object(),), daemon=True, name="insights").start()
+    flash("Measuring now. Refresh this page in a minute.")
+    return redirect(url_for("web.admin_share_insights"))
