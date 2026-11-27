@@ -2554,7 +2554,7 @@ def news_comment_delete(cid):
 # ================================================================== ADMIN (manage everything inside the app)
 ADMIN_NAV = """{% if meta_bad %}<a href="{{ url_for('web.admin_share_connect') }}" style="display:block;margin:0 0 10px;padding:10px 12px;border-radius:12px;background:#fdecea;color:#b3261e;text-decoration:none;font-size:14px"><b>⚠️ Facebook login expired.</b> Posting is paused until you reconnect. Tap here and paste a new token.</a>{% endif %}
 <div class="pills" style="margin-bottom:6px">
-{% for ep,label in [('web.admin_home','Dashboard'),('web.admin_orders','Orders'),('web.admin_products','Products'),('web.admin_packages','📦 Packages'),('web.admin_categories','Categories'),('web.admin_colors','Colours'),('web.admin_news','News'),('web.admin_settings','Settings'),('web.admin_customers','Customers'),('web.admin_share','📣 Share'),('web.qr_page','📲 QR'),('web.admin_thanks','💛 Thank you'),('web.admin_pin_change','🔐 PIN')] %}
+{% for ep,label in [('web.admin_home','Dashboard'),('web.admin_orders','Orders'),('web.admin_products','Products'),('web.admin_packages','📦 Packages'),('web.admin_categories','Categories'),('web.admin_colors','Colours'),('web.admin_news','News'),('web.admin_settings','Settings'),('web.admin_backup','💾 Backup'),('web.admin_customers','Customers'),('web.admin_share','📣 Share'),('web.qr_page','📲 QR'),('web.admin_thanks','💛 Thank you'),('web.admin_pin_change','🔐 PIN')] %}
 <a class="pill {{ 'on' if request.endpoint==ep }}" href="{{ url_for(ep) }}">{{ label }}</a>{% endfor %}</div>"""
 
 
@@ -7271,3 +7271,121 @@ def admin_share_insights_now():
     threading.Thread(target=_ins_background, args=(current_app._get_current_object(),), daemon=True, name="insights").start()
     flash("Measuring now. Refresh this page in a minute.")
     return redirect(url_for("web.admin_share_insights"))
+
+
+# ================================================================== Backup: download the whole database, restore it on any host
+def _backup_make():
+    """Consistent copy of the live database, gzipped, in a temp file next to it. Returns the path."""
+    import gzip, tempfile
+    d = os.path.dirname(os.path.abspath(CFG["DB"]))
+    fd, raw = tempfile.mkstemp(suffix=".db", prefix="bk_", dir=d)
+    os.close(fd)
+    src, dst = sqlite3.connect(CFG["DB"]), sqlite3.connect(raw)
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    gz = raw + ".gz"
+    with open(raw, "rb") as a, gzip.open(gz, "wb", compresslevel=6) as b:
+        while True:
+            chunk = a.read(1024 * 1024)
+            if not chunk:
+                break
+            b.write(chunk)
+    os.remove(raw)
+    return gz
+
+
+@bp.get("/admin/backup")
+@admin_required
+def admin_backup():
+    try:
+        size = os.path.getsize(CFG["DB"])
+    except OSError:
+        size = 0
+    return admin_page("Backup", """<p><a href="{{ url_for('web.admin_settings') }}">‹ Back</a></p><h2>💾 Backup</h2>
+<div class="card" style="padding:14px;margin-bottom:12px"><b>Download everything</b>
+<p class="mut small" style="margin:6px 0">One file with your products, packages, orders, customers, settings and Facebook/Instagram login (about {{ (size/1048576)|round(1) }} MB before compressing). Pictures are not inside: they stay in Telegram, so nothing is lost. Keep this file private, because it holds customer details and logins.</p>
+<div class="row"><a class="btn gold" href="{{ url_for('web.admin_backup_download') }}">⬇️ Download backup</a></div></div>
+<div class="card" style="padding:14px;margin-bottom:12px"><b>Restore from a backup</b>
+<p class="mut small" style="margin:6px 0">Use this on a new host, or to go back to an earlier day. <b>It replaces everything now in the app.</b> A safety copy of what is there now is kept on the server first.</p>
+<form method="post" action="{{ url_for('web.admin_backup_restore') }}" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{{ csrf }}">
+<label class="l">Backup file</label><input type="file" name="file" required>
+<label class="l">Type RESTORE to confirm</label><input name="confirm" required autocomplete="off">
+<p><button class="btn alt">Restore</button></p></form></div>
+<p class="mut small">Moving to another host: set the same BOT_TOKEN there (and SITE_URL for the new address), start the app, open this page and restore your file. Then turn the old host off so posts are not sent twice.</p>""", size=size)
+
+
+@bp.get("/admin/backup/download")
+@admin_required
+def admin_backup_download():
+    gz = _backup_make()
+    try:
+        with open(gz, "rb") as fh:
+            blob = fh.read()
+    finally:
+        try:
+            os.remove(gz)                                                    # nothing is kept on the server
+        except OSError:
+            pass
+    name = f"ad-fashion-backup-{datetime.now(LAGOS):%Y%m%d-%H%M}.db.gz"
+    return Response(blob, mimetype="application/gzip", headers={"Content-Disposition": f'attachment; filename="{name}"',
+                                                                "Cache-Control": "no-store"})
+
+
+@bp.post("/admin/backup/restore")
+@admin_required
+def admin_backup_restore():
+    import gzip, tempfile, shutil
+    if request.form.get("confirm", "").strip().upper() != "RESTORE":
+        flash("Nothing restored. Type RESTORE to confirm.")
+        return redirect(url_for("web.admin_backup"))
+    f = request.files.get("file")
+    blob = f.read() if f else b""
+    if blob[:2] == b"\x1f\x8b":
+        try:
+            blob = gzip.decompress(blob)
+        except Exception:
+            blob = b""
+    if not blob.startswith(b"SQLite format 3"):
+        flash("That is not a backup file from this app.")
+        return redirect(url_for("web.admin_backup"))
+    d = os.path.dirname(os.path.abspath(CFG["DB"]))
+    fd, tmp = tempfile.mkstemp(suffix=".db", prefix="rs_", dir=d)
+    os.close(fd)
+    try:
+        with open(tmp, "wb") as o:
+            o.write(blob)
+        c = sqlite3.connect(tmp)
+        try:
+            ok = c.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            names = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        finally:
+            c.close()
+        if not ok or not {"settings", "products", "web_users"} <= names:
+            flash("That file is damaged or is not this shop's backup. Nothing was changed.")
+            return redirect(url_for("web.admin_backup"))
+        keep = os.path.join(d, "before-restore.db")                          # safety copy of what is there now (one only)
+        a, b = sqlite3.connect(CFG["DB"]), sqlite3.connect(keep)
+        try:
+            a.backup(b)
+        finally:
+            b.close()
+            a.close()
+        src, dst = sqlite3.connect(tmp), sqlite3.connect(CFG["DB"], timeout=30)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    init_web_db()                                                            # an older backup gets any newer columns and tables
+    _pkg_init()
+    _ins_init()
+    flash("✅ Backup restored. Everything is as it was in that file.")
+    return redirect(url_for("web.admin_backup"))
