@@ -117,8 +117,9 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 PHONE_EXEMPT = {"web.complete_profile", "web.logout", "web.icon_maskable", "web.push_key", "web.admin_lock_route"}
 PUBLIC_ENDPOINTS = {
     "web.home", "web.login", "web.register_page", "web.manifest", "web.service_worker",
-    "web.google_auth", "web.pubimg", "web.pubvid", "web.pubpkg", "web.qr_png", "web.qr_card", "web.icon", "web.brand_logo", "web.brand_flyer", "web.health", "web.robots",
+    "web.google_auth", "web.transfer_export", "web.transfer_done", "web.transfer_ping", "web.transfer_receive", "web.pubimg", "web.pubvid", "web.pubpkg", "web.qr_png", "web.qr_card", "web.icon", "web.brand_logo", "web.brand_flyer", "web.health", "web.robots",
 }
+CSRF_EXEMPT = {"web.transfer_export", "web.transfer_done", "web.transfer_ping", "web.transfer_receive"}      # called by another host with a one-time key, not by a browser session
 _login_attempts = {}
 
 ICONS = {
@@ -388,7 +389,7 @@ def csrf_token():
 @bp.before_request
 def guard():
     # CSRF for every POST
-    if request.method == "POST":
+    if request.method == "POST" and request.endpoint not in CSRF_EXEMPT:
         if not secrets.compare_digest(request.form.get("csrf", "") or request.headers.get("X-CSRF", ""), session.get("csrf", "x")):
             abort(400, "Session expired. Go back and try again.")
     # Login wall: everything except the welcome/login/register pages and app assets
@@ -2552,7 +2553,7 @@ def news_comment_delete(cid):
 
 
 # ================================================================== ADMIN (manage everything inside the app)
-ADMIN_NAV = """{% if meta_bad %}<a href="{{ url_for('web.admin_share_connect') }}" style="display:block;margin:0 0 10px;padding:10px 12px;border-radius:12px;background:#fdecea;color:#b3261e;text-decoration:none;font-size:14px"><b>⚠️ Facebook login expired.</b> Posting is paused until you reconnect. Tap here and paste a new token.</a>{% endif %}
+ADMIN_NAV = """{% if standby %}<a href="{{ url_for('web.admin_backup') }}" style="display:block;margin:0 0 10px;padding:10px 12px;border-radius:12px;background:#fff4d6;color:#7a5300;text-decoration:none;font-size:14px"><b>⏸ This host is in standby.</b> Nothing is posted automatically and customers cannot order here. Tap to change.</a>{% endif %}{% if meta_bad %}<a href="{{ url_for('web.admin_share_connect') }}" style="display:block;margin:0 0 10px;padding:10px 12px;border-radius:12px;background:#fdecea;color:#b3261e;text-decoration:none;font-size:14px"><b>⚠️ Facebook login expired.</b> Posting is paused until you reconnect. Tap here and paste a new token.</a>{% endif %}
 <div class="pills" style="margin-bottom:6px">
 {% for ep,label in [('web.admin_home','Dashboard'),('web.admin_orders','Orders'),('web.admin_products','Products'),('web.admin_packages','📦 Packages'),('web.admin_categories','Categories'),('web.admin_colors','Colours'),('web.admin_news','News'),('web.admin_settings','Settings'),('web.admin_backup','💾 Backup'),('web.admin_customers','Customers'),('web.admin_share','📣 Share'),('web.qr_page','📲 QR'),('web.admin_thanks','💛 Thank you'),('web.admin_pin_change','🔐 PIN')] %}
 <a class="pill {{ 'on' if request.endpoint==ep }}" href="{{ url_for(ep) }}">{{ label }}</a>{% endfor %}</div>"""
@@ -2561,6 +2562,7 @@ ADMIN_NAV = """{% if meta_bad %}<a href="{{ url_for('web.admin_share_connect') }
 def admin_page(title, body, **ctx):
     tab = "share" if title.startswith(("Share", "Reel", "Connect")) else "admin"
     ctx.setdefault("meta_bad", _meta_bad())
+    ctx.setdefault("standby", standby_on())
     return page(title, ADMIN_NAV + body, tab=tab, **ctx)
 
 
@@ -4110,6 +4112,8 @@ JOBS_SYNC = False            # tests switch this on to run a job in the same req
 def queue_job(kind, pid="", want=(), picked=(), caps=None, take=0):
     """Queue a post and start it in the background. Returns the job id, or None if the same post is already on its way."""
     from flask import current_app
+    if standby_on():
+        return None
     if db().execute("""SELECT 1 FROM share_jobs WHERE product_id=? AND kind=? AND status IN ('queued','working')
                        AND created_at>=datetime('now','-10 minutes')""", (pid, kind)).fetchone():
         return None
@@ -4392,6 +4396,8 @@ def auto_tick(flask_app, now=None, sync=None):
         try:
             now = now or datetime.now(LAGOS)
             set_setting("auto_beat", str(int(time.time())))               # "I am alive" signal shown on the Share page
+            if standby_on():                                               # handed over to another host: do nothing automatic here
+                return ran
             for kind, s in _due_slots(now):
                 skey = _slot_key(kind, s)
                 if setting("auto_done_" + skey):
@@ -4410,6 +4416,8 @@ def auto_tick(flask_app, now=None, sync=None):
                     threading.Thread(target=_run_slot, args=(flask_app, kind, skey), daemon=True, name="auto-" + skey).start()
             if now.minute % 30 == 7:                                       # tidy old bookkeeping
                 _auto_cleanup(now)
+            usage_tick(flask_app)                                          # estimate Railway usage, warn near the limit
+            backup_tick(flask_app)                                         # automatic backup to email / Telegram when due
             insights_tick(flask_app)                                       # measure yesterday's posts (own thread, every 20 minutes)
         except Exception as e:
             try:
@@ -7304,17 +7312,82 @@ def admin_backup():
         size = os.path.getsize(CFG["DB"])
     except OSError:
         size = 0
+    lastts = to_int(setting("bk_last", "0"), 0) or 0
+    hrs = to_int(setting("bk_hours", "12"), 12)
+    smtp = _smtp_conf()
     return admin_page("Backup", """<p><a href="{{ url_for('web.admin_settings') }}">‹ Back</a></p><h2>💾 Backup</h2>
 <div class="card" style="padding:14px;margin-bottom:12px"><b>Download everything</b>
 <p class="mut small" style="margin:6px 0">One file with your products, packages, orders, customers, settings and Facebook/Instagram login (about {{ (size/1048576)|round(1) }} MB before compressing). Pictures are not inside: they stay in Telegram, so nothing is lost. Keep this file private, because it holds customer details and logins.</p>
 <div class="row"><a class="btn gold" href="{{ url_for('web.admin_backup_download') }}">⬇️ Download backup</a></div></div>
+<div class="card" style="padding:14px;margin-bottom:12px"><b>📊 Railway usage (estimate)</b>
+<p class="mut small" style="margin:6px 0">The app measures its own memory and processor time and prices them like Railway does. It is an estimate, not Railway's own number. Since {{ ru['start'] }}:</p>
+<div style="font-size:26px;font-weight:800">${{ '%.2f'|format(ru['used']) }} <span class="mut" style="font-size:15px;font-weight:500">of ${{ '%.2f'|format(ru['credit']) }} free credit</span></div>
+<div style="height:10px;border-radius:6px;background:#e6e6e6;margin:8px 0;overflow:hidden"><div style="height:10px;width:{{ [ru['pct'],100]|min|round|int }}%;background:{{ '#c0392b' if ru['pct']>=90 else ('#e0a100' if ru['pct']>=75 else '#2a8a4a') }}"></div></div>
+<p class="small mut" style="margin:0 0 8px">{{ ru['pct']|round|int }}% used. At 75% and 90% you get a notification and a backup is sent straight away.</p>
+<form method="post" action="{{ url_for('web.admin_backup_usage') }}"><input type="hidden" name="csrf" value="{{ csrf }}">
+<label class="l"><input type="checkbox" name="on" value="1" {{ 'checked' if ru['on'] }}> Warn me and send a backup near the limit</label>
+<label class="l">Today's number on Railway's Usage page ("Current Usage" in dollars): <span class="mut">type it now and then once in a while, so the estimate stays close</span></label><input name="current" inputmode="decimal" placeholder="for example 0.85" autocomplete="off">
+<details style="margin:8px 0"><summary class="mut small">Free credit and billing day</summary>
+<label class="l">Free credit in dollars</label><input name="credit" value="{{ '%.2f'|format(ru['credit']) }}" inputmode="decimal">
+<label class="l">Day of the month your Railway billing renews</label><input name="day" value="{{ ru_day }}" inputmode="numeric"></details>
+<p><button class="btn gold sm">Save</button></p></form></div>
+<div class="card" style="padding:14px;margin-bottom:12px"><b>Automatic backup</b>
+<p class="mut small" style="margin:6px 0">Sends a fresh backup by itself, so you have a recent copy even if Railway stops the app. {% if last %}Last sent: <b>{{ last }}</b>.{% else %}Nothing sent yet.{% endif %}{% if err %} <span style="color:#b3261e">Problem: {{ err }}</span>{% endif %}</p>
+<form method="post" action="{{ url_for('web.admin_backup_settings') }}"><input type="hidden" name="csrf" value="{{ csrf }}">
+<label class="l"><input type="checkbox" name="on" value="1" {{ 'checked' if on }}> Send backups automatically</label>
+<label class="l">How often</label><select name="hours">{% for h in choices %}<option value="{{ h }}" {{ 'selected' if h==hrs }}>every {{ h }} hours</option>{% endfor %}</select>
+<label class="l"><input type="checkbox" name="tg" value="1" {{ 'checked' if tg }}> Send to my Telegram</label>
+<label class="l"><input type="checkbox" name="mail_on" value="1" {{ 'checked' if mail_on }}> Send to my email</label>
+<label class="l">Email address to receive it</label><input name="email" type="email" value="{{ email }}" placeholder="you@gmail.com" autocomplete="off">
+<details style="margin:8px 0"><summary class="mut small">Mail login (needed for email){% if pw_saved %} · saved{% endif %}</summary>
+<p class="mut small">Gmail: host smtp.gmail.com, port 465, your Gmail address as user name, and an App Password (Google account, Security, 2-Step Verification, App passwords).</p>
+<label class="l">SMTP host</label><input name="host" value="{{ smtp['host'] }}" placeholder="smtp.gmail.com" autocomplete="off">
+<label class="l">Port</label><input name="port" value="{{ smtp['port'] }}" inputmode="numeric" autocomplete="off">
+<label class="l">User name (the sending email)</label><input name="user" value="{{ smtp['user'] }}" autocomplete="off">
+<label class="l">Password / App Password {% if pw_saved %}<span class="mut">(saved, leave empty to keep)</span>{% endif %}</label><input name="pw" type="password" autocomplete="new-password"></details>
+<p><button class="btn gold">Save</button></p></form>
+<form method="post" action="{{ url_for('web.admin_backup_send') }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn alt sm">📤 Send a backup now</button></form></div>
+<div class="card" style="padding:14px;margin-bottom:12px"><b>🔁 Move to another host (no file needed)</b>
+<p class="mut small" style="margin:6px 0">Use this when the app runs on two hosts at different times. The host with the newest data allows the transfer. The other host takes everything from it, and the first one goes to standby so nothing is posted twice.</p>
+<p class="small" style="margin:8px 0 4px"><b>1. On the host that has the newest data</b></p>
+<form method="post" action="{{ url_for('web.admin_backup_allow') }}" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn alt sm">🔑 Allow a transfer (2 hours)</button></form>
+{% if tr_open %}<form method="post" action="{{ url_for('web.admin_backup_stop_allow') }}" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn alt sm">Switch it off</button></form> <span class="mut small">open until {{ tr_until }}</span>{% endif %}
+<p class="small" style="margin:12px 0 4px"><b>2. On the host that should take over</b></p>
+<form method="post" action="{{ url_for('web.admin_backup_take') }}"><input type="hidden" name="csrf" value="{{ csrf }}">
+<label class="l">Address of the other host (https://...)</label><input name="address" placeholder="https://the-other-host.example.com" autocomplete="off">
+<label class="l">Transfer key</label><input name="key" autocomplete="off">
+<p class="mut small">This replaces everything on this host with the other host's data.</p>
+<p><button class="btn gold sm">Take over the data</button></p></form>
+<form method="post" action="{{ url_for('web.admin_backup_standby') }}"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="on" value="{{ '0' if standby else '1' }}">
+<p class="small" style="margin:12px 0 4px"><b>Standby</b> {% if standby %}<span style="color:#7a5300">is ON for this host</span>{% else %}is off{% endif %}: stops all automatic posting and customer orders on this host.</p>
+<button class="btn alt sm">{{ 'Turn standby off' if standby else 'Turn standby on' }}</button></form></div>
+<div class="card" style="padding:14px;margin-bottom:12px"><b>⚡ Automatic hand-over near the limit</b>
+<p class="mut small" style="margin:6px 0">When the estimated Railway usage reaches the level below, this host sends all its data to your other host. The other host becomes active and keeps posting, and this one goes to standby. {% if ho_done %}<b>Done this month.</b>{% endif %}{% if ho_err %} <span style="color:#b3261e">Last problem: {{ ho_err }}</span>{% endif %}</p>
+<p class="small" style="margin:8px 0 4px"><b>On the other host first</b> (the one that should take over):</p>
+<form method="post" action="{{ url_for('web.admin_backup_rxkey') }}" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn alt sm">🔑 {{ 'Make a new receive key' if rx_set else 'Create a receive key' }}</button></form>
+{% if rx_set %}<form method="post" action="{{ url_for('web.admin_backup_rxoff') }}" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn alt sm">Stop accepting</button></form> <span class="mut small">this host accepts hand-overs</span>{% endif %}
+<p class="small" style="margin:12px 0 4px"><b>On this host</b> (the one that will run out):</p>
+<form method="post" action="{{ url_for('web.admin_backup_ho_save') }}"><input type="hidden" name="csrf" value="{{ csrf }}">
+<label class="l"><input type="checkbox" name="on" value="1" {{ 'checked' if ho_on }}> Hand over automatically</label>
+<label class="l">Address of the other host (https://...)</label><input name="addr" value="{{ ho_addr }}" placeholder="https://the-other-host.example.com" autocomplete="off">
+<label class="l">Its receive key {% if ho_key_saved %}<span class="mut">(saved, leave empty to keep)</span>{% endif %}</label><input name="key" type="password" autocomplete="new-password">
+<label class="l">Hand over at this percent of the free credit</label><input name="pct" value="{{ ho_pct }}" inputmode="numeric">
+<p><button class="btn gold sm">Save</button></p></form>
+<form method="post" action="{{ url_for('web.admin_backup_ho_check') }}" style="display:inline"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn alt sm">🔎 Check the connection</button></form>
+<form method="post" action="{{ url_for('web.admin_backup_ho_now') }}" style="margin-top:10px"><input type="hidden" name="csrf" value="{{ csrf }}"><label class="l">Hand over right now: type HANDOVER</label><input name="confirm" autocomplete="off" style="max-width:200px"> <button class="btn alt sm">Hand over now</button></form></div>
 <div class="card" style="padding:14px;margin-bottom:12px"><b>Restore from a backup</b>
 <p class="mut small" style="margin:6px 0">Use this on a new host, or to go back to an earlier day. <b>It replaces everything now in the app.</b> A safety copy of what is there now is kept on the server first.</p>
 <form method="post" action="{{ url_for('web.admin_backup_restore') }}" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{{ csrf }}">
 <label class="l">Backup file</label><input type="file" name="file" required>
 <label class="l">Type RESTORE to confirm</label><input name="confirm" required autocomplete="off">
 <p><button class="btn alt">Restore</button></p></form></div>
-<p class="mut small">Moving to another host: set the same BOT_TOKEN there (and SITE_URL for the new address), start the app, open this page and restore your file. Then turn the old host off so posts are not sent twice.</p>""", size=size)
+<p class="mut small">Moving to another host: set the same BOT_TOKEN there (and SITE_URL for the new address), start the app, open this page and restore your file. Then turn the old host off so posts are not sent twice.</p>""", size=size, last=(datetime.fromtimestamp(lastts, LAGOS).strftime("%d %b %H:%M") if lastts else ""), err=setting("bk_err", ""),
+                      on=setting("bk_on", "0") == "1", hrs=hrs, choices=BK_CHOICES, tg=setting("bk_tg", "1") == "1",
+                      mail_on=setting("bk_mail_on", "1") == "1", email=setting("bk_email", ""), smtp=smtp, pw_saved=bool(smtp["pw"]), ru=usage_status(), ru_day=setting("ru_day", "17"),
+                      standby=standby_on(), rx_set=bool(setting("rx_hash", "")), ho_on=setting("ho_on", "0") == "1", ho_addr=setting("ho_addr", ""),
+                      ho_key_saved=bool(setting("ho_key", "")), ho_pct=setting("ho_pct", "95"), ho_err=setting("ho_err", ""),
+                      ho_done=bool(setting("ho_done", "")) and setting("ho_done") == setting("ru_period", ""), tr_open=bool(setting("tr_hash", "")) and time.time() < to_float(setting("tr_until", "0")),
+                      tr_until=(datetime.fromtimestamp(to_float(setting("tr_until", "0")), LAGOS).strftime("%H:%M") if to_float(setting("tr_until", "0")) else ""))
 
 
 @bp.get("/admin/backup/download")
@@ -7334,23 +7407,46 @@ def admin_backup_download():
                                                                 "Cache-Control": "no-store"})
 
 
-@bp.post("/admin/backup/restore")
-@admin_required
-def admin_backup_restore():
-    import gzip, tempfile, shutil
-    if request.form.get("confirm", "").strip().upper() != "RESTORE":
-        flash("Nothing restored. Type RESTORE to confirm.")
-        return redirect(url_for("web.admin_backup"))
-    f = request.files.get("file")
-    blob = f.read() if f else b""
+HOST_PREFIX = ("ru_", "tr_", "ho_", "rx_")
+HOST_EXACT = {"standby", "site_seen", "web_secret"}
+
+
+def _is_host_key(k):
+    return k.startswith(HOST_PREFIX) or k in HOST_EXACT
+
+
+def _host_settings():
+    """Settings that belong to THIS host (its address, usage count, hand-over keys): they must survive a restore from another host."""
+    c = sqlite3.connect(CFG["DB"])
+    try:
+        return {k: v for k, v in c.execute("SELECT key,value FROM settings").fetchall() if _is_host_key(k)}
+    finally:
+        c.close()
+
+
+def _host_apply(keep):
+    c = sqlite3.connect(CFG["DB"], timeout=30)
+    try:
+        for (k,) in c.execute("SELECT key FROM settings").fetchall():
+            if _is_host_key(k) and k not in keep:
+                c.execute("DELETE FROM settings WHERE key=?", (k,))
+        for k, v in keep.items():
+            c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (k, v))
+        c.commit()
+    finally:
+        c.close()
+
+
+def _restore_blob(blob):
+    """Put a backup (raw SQLite bytes, or gzip of it) in place of the live database. Returns (ok, message)."""
+    import gzip, tempfile
     if blob[:2] == b"\x1f\x8b":
         try:
             blob = gzip.decompress(blob)
         except Exception:
             blob = b""
     if not blob.startswith(b"SQLite format 3"):
-        flash("That is not a backup file from this app.")
-        return redirect(url_for("web.admin_backup"))
+        return False, "That is not a backup file from this app."
     d = os.path.dirname(os.path.abspath(CFG["DB"]))
     fd, tmp = tempfile.mkstemp(suffix=".db", prefix="rs_", dir=d)
     os.close(fd)
@@ -7364,8 +7460,7 @@ def admin_backup_restore():
         finally:
             c.close()
         if not ok or not {"settings", "products", "web_users"} <= names:
-            flash("That file is damaged or is not this shop's backup. Nothing was changed.")
-            return redirect(url_for("web.admin_backup"))
+            return False, "That file is damaged or is not this shop's backup. Nothing was changed."
         keep = os.path.join(d, "before-restore.db")                          # safety copy of what is there now (one only)
         a, b = sqlite3.connect(CFG["DB"]), sqlite3.connect(keep)
         try:
@@ -7373,12 +7468,14 @@ def admin_backup_restore():
         finally:
             b.close()
             a.close()
+        mine = _host_settings()
         src, dst = sqlite3.connect(tmp), sqlite3.connect(CFG["DB"], timeout=30)
         try:
             src.backup(dst)
         finally:
             dst.close()
             src.close()
+        _host_apply(mine)
     finally:
         try:
             os.remove(tmp)
@@ -7387,5 +7484,599 @@ def admin_backup_restore():
     init_web_db()                                                            # an older backup gets any newer columns and tables
     _pkg_init()
     _ins_init()
-    flash("✅ Backup restored. Everything is as it was in that file.")
+    return True, "✅ Backup restored. Everything is as it was in that file."
+
+
+@bp.post("/admin/backup/restore")
+@admin_required
+def admin_backup_restore():
+    if request.form.get("confirm", "").strip().upper() != "RESTORE":
+        flash("Nothing restored. Type RESTORE to confirm.")
+        return redirect(url_for("web.admin_backup"))
+    f = request.files.get("file")
+    ok, msg = _restore_blob(f.read() if f else b"")
+    flash(msg)
+    return redirect(url_for("web.admin_backup"))
+
+
+# ---------------------------------------------------------------- automatic backup: sent to your email and/or Telegram
+BK_CHOICES = (3, 6, 12, 24)
+
+
+def _smtp_conf():
+    """SMTP login: Railway variables win, else what was saved in the app. The password is never shown on any page."""
+    e = os.environ.get
+    return {"host": (e("SMTP_HOST") or setting("smtp_host", "")).strip(),
+            "port": to_int(e("SMTP_PORT") or setting("smtp_port", "465"), 465) or 465,
+            "user": (e("SMTP_USER") or setting("smtp_user", "")).strip(),
+            "pw": (e("SMTP_PASSWORD") or setting("smtp_pass", "")).strip()}
+
+
+def _send_email(blob, name, to):
+    import smtplib, ssl
+    from email.message import EmailMessage
+    c = _smtp_conf()
+    if not (c["host"] and c["user"] and c["pw"] and to):
+        raise RuntimeError("Email is not set up yet: fill in the email address, SMTP host, user name and password.")
+    if len(blob) > 20 * 1024 * 1024:
+        raise RuntimeError("The backup is too big to email (over 20 MB). Telegram can still take it.")
+    m = EmailMessage()
+    m["Subject"] = f"AD Fashion backup {datetime.now(LAGOS):%d %b %Y %H:%M}"
+    m["From"], m["To"] = c["user"], to
+    m.set_content("Your AD Fashion shop backup is attached. Keep it private: it holds customer details and logins.\n"
+                  "To use it: Admin, Backup, Restore.")
+    m.add_attachment(blob, maintype="application", subtype="gzip", filename=name)
+    try:
+        if c["port"] == 465:
+            s = smtplib.SMTP_SSL(c["host"], 465, timeout=30, context=ssl.create_default_context())
+        else:
+            s = smtplib.SMTP(c["host"], c["port"], timeout=30)
+            s.starttls(context=ssl.create_default_context())
+        try:
+            s.login(c["user"], c["pw"])
+            s.send_message(m)
+        finally:
+            try:
+                s.quit()
+            except Exception:
+                pass
+    except smtplib.SMTPAuthenticationError:
+        raise RuntimeError("The mail server refused the login. For Gmail use an App Password, not your normal password.")
+    except Exception as e:
+        raise RuntimeError(f"Email failed: {str(e)[:150]}")
+
+
+def _send_telegram(blob, name):
+    try:
+        r = _api("sendDocument", {"chat_id": CFG["ADMIN_ID"], "disable_notification": "true",
+                                  "caption": f"💾 Shop backup {datetime.now(LAGOS):%d %b %Y %H:%M}. Keep it private."},
+                 files={"document": (name, blob)}, timeout=90)
+    except Exception as e:
+        raise RuntimeError(f"Telegram failed: {str(e)[:150]}")
+    if not r.get("ok"):
+        raise RuntimeError("Telegram refused the file.")
+
+
+def run_backup(manual=False):
+    """Make one backup and send it to every channel that is switched on. Returns (ok, [messages])."""
+    want_mail = bool(setting("bk_email", "").strip()) and (setting("bk_mail_on", "1") == "1")
+    want_tg = setting("bk_tg", "1") == "1"
+    if not (want_mail or want_tg):
+        return False, ["Switch on email or Telegram first."]
+    gz = _backup_make()
+    try:
+        with open(gz, "rb") as fh:
+            blob = fh.read()
+    finally:
+        try:
+            os.remove(gz)
+        except OSError:
+            pass
+    name = f"ad-fashion-backup-{datetime.now(LAGOS):%Y%m%d-%H%M}.db.gz"
+    out, ok, bad = [], False, []
+    for on, label, fn in ((want_mail, "email", lambda: _send_email(blob, name, setting("bk_email", "").strip())),
+                          (want_tg, "Telegram", lambda: _send_telegram(blob, name))):
+        if not on:
+            continue
+        try:
+            fn()
+            ok = True
+            out.append(f"✅ Sent to {label}")
+        except RuntimeError as e:
+            bad.append(str(e))
+            out.append(f"❌ {e}")
+    if ok:
+        set_setting("bk_last", str(int(time.time())))
+    set_setting("bk_err", " | ".join(bad)[:300])
+    if bad:
+        last = to_int(setting("bk_push", "0"), 0) or 0
+        if time.time() - last > 12 * 3600 and not manual:
+            set_setting("bk_push", str(int(time.time())))
+            push_admins("⚠️ Backup problem", bad[0][:120], url="/admin/backup", tag="backup")
+    return ok, out
+
+
+_BK_BUSY = threading.Lock()
+
+
+def _bk_background(flask_app):
+    if not _BK_BUSY.acquire(blocking=False):
+        return
+    try:
+        with flask_app.app_context():
+            try:
+                run_backup()
+            finally:
+                try:
+                    db().close()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    finally:
+        _BK_BUSY.release()
+
+
+def backup_tick(flask_app):
+    """Called by the clock. When a backup is due (and the last try was 30 minutes ago or more), it runs in its own thread."""
+    try:
+        if setting("bk_on", "0") != "1":
+            return
+        hrs = to_int(setting("bk_hours", "12"), 12)
+        hrs = hrs if hrs in BK_CHOICES else 12
+        now = time.time()
+        if now - (to_int(setting("bk_last", "0"), 0) or 0) < hrs * 3600:
+            return
+        if now - (to_int(setting("bk_try", "0"), 0) or 0) < 1800:
+            return
+        set_setting("bk_try", str(int(now)))
+        threading.Thread(target=_bk_background, args=(flask_app,), daemon=True, name="backup").start()
+    except Exception:
+        pass
+
+
+@bp.post("/admin/backup/settings")
+@admin_required
+def admin_backup_settings():
+    f = request.form
+    set_setting("bk_on", "1" if f.get("on") else "0")
+    hrs = to_int(f.get("hours", "12"), 12)
+    set_setting("bk_hours", str(hrs if hrs in BK_CHOICES else 12))
+    set_setting("bk_tg", "1" if f.get("tg") else "0")
+    set_setting("bk_mail_on", "1" if f.get("mail_on") else "0")
+    set_setting("bk_email", f.get("email", "").strip()[:120])
+    for k in ("host", "user"):
+        set_setting("smtp_" + k, f.get(k, "").strip()[:120])
+    set_setting("smtp_port", str(to_int(f.get("port", "465"), 465) or 465))
+    if f.get("pw", "").strip():                                              # blank keeps the saved password
+        set_setting("smtp_pass", f["pw"].strip()[:200])
+    if setting("bk_on", "0") == "1":
+        set_setting("bk_try", "0")                                           # a due backup goes out at the next tick
+    flash("Saved." + (" The first backup goes out within a minute." if setting("bk_on") == "1" and not setting("bk_last") else ""))
+    return redirect(url_for("web.admin_backup"))
+
+
+@bp.post("/admin/backup/send")
+@admin_required
+def admin_backup_send():
+    ok, msgs = run_backup(manual=True)
+    for m in msgs:
+        flash(m)
+    return redirect(url_for("web.admin_backup"))
+
+
+# ---------------------------------------------------------------- Railway usage estimate (no Railway login needed)
+# The app measures its own memory and processor time, prices them like Railway does, and warns before the free credit runs out.
+RU_MEM = 0.000231       # dollars per GB of memory per minute  ($10 / GB / month)
+RU_CPU = 0.000463       # dollars per vCPU per minute          ($20 / vCPU / month)
+RU_OTHER = 1.10         # +10% for network and disk, which are small for this app
+def to_float(v, d=0.0):
+    try:
+        return float(str(v).replace("$", "").replace(",", "").strip())
+    except (TypeError, ValueError):
+        return d
+
+
+_RU = {"last": None, "cpu": None, "gbmin": 0.0, "cpumin": 0.0, "flush": 0.0}
+
+
+def _rss_gb():
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1048576.0         # kB -> GB
+    except Exception:
+        pass
+    try:
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1048576.0
+    except Exception:
+        return 0.1
+
+
+def _ru_period_start(now=None):
+    """Start (as 'YYYY-MM-DD') of the current Railway billing month, which renews on the chosen day of the month."""
+    now = now or datetime.now(timezone.utc)
+    day = min(max(to_int(setting("ru_day", "17"), 17) or 17, 1), 28)
+    y, m = now.year, now.month
+    if now.day < day:
+        m -= 1
+        if m == 0:
+            y, m = y - 1, 12
+    return f"{y:04d}-{m:02d}-{day:02d}"
+
+
+def _ru_flush():
+    if _RU["gbmin"] or _RU["cpumin"]:
+        set_setting("ru_gbmin", repr(float(setting("ru_gbmin", "0") or 0) + _RU["gbmin"]))
+        set_setting("ru_cpumin", repr(float(setting("ru_cpumin", "0") or 0) + _RU["cpumin"]))
+        _RU["gbmin"] = _RU["cpumin"] = 0.0
+    _RU["flush"] = time.time()
+
+
+def _ru_roll(now=None):
+    """A new billing month: start counting from zero again and allow the warnings again."""
+    start = _ru_period_start(now)
+    if setting("ru_period", "") != start:
+        _RU["gbmin"] = _RU["cpumin"] = 0.0
+        for k in ("ru_gbmin", "ru_cpumin", "ru_offset", "ru_warn75", "ru_warn90"):
+            set_setting(k, "0")
+        set_setting("ru_period", start)
+
+
+def usage_status(now=None):
+    _ru_roll(now)
+    gb = float(setting("ru_gbmin", "0") or 0) + _RU["gbmin"]
+    cpu = float(setting("ru_cpumin", "0") or 0) + _RU["cpumin"]
+    raw = (gb * RU_MEM + cpu * RU_CPU) * RU_OTHER
+    off = float(setting("ru_offset", "0") or 0)
+    credit = float(setting("ru_credit", "1.00") or 1.0)
+    used = max(0.0, raw + off)
+    return {"raw": raw, "used": used, "credit": credit, "pct": (used / credit * 100) if credit else 0,
+            "start": setting("ru_period", ""), "gb": gb, "cpu": cpu, "on": setting("ru_on", "1") == "1"}
+
+
+def usage_tick(flask_app, now_ts=None):
+    """Called by the clock every few seconds; takes a sample about once a minute and warns at 75% and 90% of the free credit."""
+    try:
+        t = now_ts if now_ts is not None else time.time()
+        _ru_roll()
+        if _RU["last"] is None:
+            _RU["last"], _RU["cpu"] = t, sum(os.times()[:2])
+            return
+        if t - _RU["last"] < 55:
+            return
+        dt = min(t - _RU["last"], 300) / 60.0                     # a gap longer than 5 minutes (app was off) is not counted
+        _RU["gbmin"] += _rss_gb() * dt
+        c = sum(os.times()[:2])
+        _RU["cpumin"] += max(0.0, c - _RU["cpu"]) / 60.0
+        _RU["last"], _RU["cpu"] = t, c
+        if t - _RU["flush"] >= 600:
+            _ru_flush()
+        st = usage_status()
+        if setting("ru_on", "1") != "1":
+            return
+        if (setting("ho_on", "0") == "1" and st["pct"] >= (to_int(setting("ho_pct", "95"), 95) or 95)
+                and setting("ho_done", "") != st["start"] and (to_int(setting("ho_fails", "0"), 0) or 0) < 3
+                and time.time() - (to_float(setting("ho_try", "0"))) >= 600):
+            set_setting("ho_try", str(time.time()))
+            threading.Thread(target=_ho_background, args=(flask_app,), daemon=True, name="handover").start()
+        for pct, key in ((90, "ru_warn90"), (75, "ru_warn75")):
+            if st["pct"] >= pct and setting(key, "0") != "1":
+                set_setting(key, "1")
+                if pct == 90:
+                    set_setting("ru_warn75", "1")
+                try:
+                    push_admins(f"⚠️ Railway credit about {pct}% used",
+                                f"Estimated ${st['used']:.2f} of ${st['credit']:.2f}. The app may stop soon. A backup is being sent now.",
+                                url="/admin/backup", tag="railwayuse")
+                except Exception:
+                    pass
+                threading.Thread(target=_bk_background, args=(flask_app,), daemon=True, name="backup-warn").start()
+                break
+    except Exception:
+        pass
+
+
+@bp.post("/admin/backup/usage")
+@admin_required
+def admin_backup_usage():
+    f = request.form
+    _ru_roll()
+    set_setting("ru_on", "1" if f.get("on") else "0")
+    set_setting("ru_credit", str(max(0.1, to_float(f.get("credit", "1"), 1.0) or 1.0)))
+    set_setting("ru_day", str(min(max(to_int(f.get("day", "17"), 17) or 17, 1), 28)))
+    cur = f.get("current", "").strip()
+    if cur:                                                                  # his number from Railway's Usage page: remember the difference
+        try:
+            val = float(cur.replace("$", "").replace(",", ""))
+            _ru_roll()
+            st = usage_status()
+            set_setting("ru_offset", repr(val - st["raw"]))
+        except ValueError:
+            flash("Please type the current usage as a number, for example 0.85.")
+            return redirect(url_for("web.admin_backup"))
+    flash("Saved.")
+    return redirect(url_for("web.admin_backup"))
+
+
+# ---------------------------------------------------------------- hand over to another host (no file to download)
+def standby_on():
+    try:
+        return setting("standby", "0") == "1"
+    except Exception:
+        return False
+
+
+def _tr_check(key):
+    """The one-time key: valid for a limited time, five wrong tries lock it for 15 minutes."""
+    now = time.time()
+    h, until = setting("tr_hash", ""), to_float(setting("tr_until", "0"))
+    fails = (setting("tr_fails", "0|0") or "0|0").split("|")
+    n, t = (to_int(fails[0], 0) or 0), (to_float(fails[1]) if len(fails) > 1 else 0.0)
+    if n >= 5 and now - t < 900:
+        return False
+    if not h or now > until or not key:
+        return False
+    if secrets.compare_digest(hashlib.sha256(key.encode()).hexdigest(), h):
+        set_setting("tr_fails", "0|0")
+        return True
+    set_setting("tr_fails", f"{n + 1 if now - t < 900 else 1}|{now}")
+    return False
+
+
+@bp.post("/transfer/export")
+def transfer_export():
+    if not _tr_check(request.form.get("key", "")):
+        return Response("Not allowed.", status=403, mimetype="text/plain")
+    gz = _backup_make()
+    try:
+        with open(gz, "rb") as fh:
+            blob = fh.read()
+    finally:
+        try:
+            os.remove(gz)
+        except OSError:
+            pass
+    return Response(blob, mimetype="application/gzip", headers={"Cache-Control": "no-store"})
+
+
+@bp.post("/transfer/done")
+def transfer_done():
+    """The other host took the data: this one goes to standby and the key stops working."""
+    if not _tr_check(request.form.get("key", "")):
+        return Response("Not allowed.", status=403, mimetype="text/plain")
+    set_setting("standby", "1")
+    set_setting("tr_hash", "")
+    set_setting("tr_until", "0")
+    return Response("ok", mimetype="text/plain")
+
+
+@bp.post("/admin/backup/allow")
+@admin_required
+def admin_backup_allow():
+    key = secrets.token_urlsafe(14)
+    set_setting("tr_hash", hashlib.sha256(key.encode()).hexdigest())
+    set_setting("tr_until", str(time.time() + 2 * 3600))
+    set_setting("tr_fails", "0|0")
+    flash(f"Transfer key (shown only now, valid 2 hours): {key}")
+    flash(f"This host's address: {request.host_url.rstrip('/')}")
+    return redirect(url_for("web.admin_backup"))
+
+
+@bp.post("/admin/backup/stop-allow")
+@admin_required
+def admin_backup_stop_allow():
+    set_setting("tr_hash", "")
+    set_setting("tr_until", "0")
+    flash("Transfer switched off.")
+    return redirect(url_for("web.admin_backup"))
+
+
+@bp.post("/admin/backup/take")
+@admin_required
+def admin_backup_take():
+    """Pull everything from the other host, restore it here, then tell that host to go to standby."""
+    base = request.form.get("address", "").strip().rstrip("/")
+    key = request.form.get("key", "").strip()
+    if not base.startswith("https://") or not key:
+        flash("Type the other host's address (starting with https://) and the transfer key.")
+        return redirect(url_for("web.admin_backup"))
+    data = urllib.parse.urlencode({"key": key}).encode()
+    try:
+        blob = urllib.request.urlopen(urllib.request.Request(base + "/transfer/export", data=data, method="POST"), timeout=90).read(41 * 1024 * 1024)
+    except urllib.error.HTTPError as e:
+        flash("The other host refused: " + ("wrong or expired key." if e.code == 403 else f"error {e.code}."))
+        return redirect(url_for("web.admin_backup"))
+    except Exception as e:
+        flash(f"Could not reach the other host: {str(e)[:120]}")
+        return redirect(url_for("web.admin_backup"))
+    ok, msg = _restore_blob(blob)
+    flash(msg)
+    if ok:
+        set_setting("standby", "0")                                          # this host now has the newest data and is the active one
+        try:
+            urllib.request.urlopen(urllib.request.Request(base + "/transfer/done", data=data, method="POST"), timeout=30).read()
+            flash("The other host is now in standby.")
+        except Exception:
+            flash("Data copied, but the other host could not be put in standby. Turn it off in its dashboard.")
+    return redirect(url_for("web.admin_backup"))
+
+
+@bp.post("/admin/backup/standby")
+@admin_required
+def admin_backup_standby():
+    on = request.form.get("on") == "1"
+    set_setting("standby", "1" if on else "0")
+    flash("Standby is on: nothing is posted automatically and customers cannot order here." if on else "Standby is off: this host is active again.")
+    return redirect(url_for("web.admin_backup"))
+
+
+@bp.before_app_request
+def _standby_block():
+    """A host in standby must not take customer orders, or the data would split between two hosts."""
+    if standby_on() and request.method == "POST" and request.endpoint in ("web.checkout", "web.cart_add", "web.package_add"):
+        return Response("This shop address is paused for a moment. Please try again later.", status=503, mimetype="text/plain")
+
+
+# ---------------------------------------------------------------- automatic hand-over to the other host at a usage level
+def _post_multipart(url, fields, fname, blob, timeout=180):
+    boundary = secrets.token_hex(12)
+    body = []
+    for k, v in fields.items():
+        body.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
+    body.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{fname}"\r\nContent-Type: application/gzip\r\n\r\n'.encode())
+    body.append(blob)
+    body.append(f"\r\n--{boundary}--\r\n".encode())
+    req = urllib.request.Request(url, data=b"".join(body), headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}, method="POST")
+    return urllib.request.urlopen(req, timeout=timeout).read()
+
+
+def _rx_check(key):
+    """The permanent receive key of this host: five wrong tries lock it for 15 minutes."""
+    now = time.time()
+    h = setting("rx_hash", "")
+    fails = (setting("rx_fails", "0|0") or "0|0").split("|")
+    n, t = (to_int(fails[0], 0) or 0), (to_float(fails[1]) if len(fails) > 1 else 0.0)
+    if not h or not key or (n >= 5 and now - t < 900):
+        return False
+    if secrets.compare_digest(hashlib.sha256(key.encode()).hexdigest(), h):
+        set_setting("rx_fails", "0|0")
+        return True
+    set_setting("rx_fails", f"{n + 1 if now - t < 900 else 1}|{now}")
+    return False
+
+
+@bp.post("/transfer/ping")
+def transfer_ping():
+    if not _rx_check(request.form.get("key", "")):
+        return Response("Not allowed.", status=403, mimetype="text/plain")
+    return Response("ok", mimetype="text/plain")
+
+
+@bp.post("/transfer/receive")
+def transfer_receive():
+    if not _rx_check(request.form.get("key", "")):
+        return Response("Not allowed.", status=403, mimetype="text/plain")
+    f = request.files.get("file")
+    ok, msg = _restore_blob(f.read() if f else b"")
+    if not ok:
+        return Response(msg, status=400, mimetype="text/plain")
+    set_setting("standby", "0")                                               # this host is now the active one
+    try:
+        push_admins("🔁 Hand-over received", "This host now has the newest data and is active. Posting continues from here.", url="/admin/share", tag="handover")
+    except Exception:
+        pass
+    return Response("ok", mimetype="text/plain")
+
+
+def handover_push():
+    """Send everything to the other host. Returns (ok, message). On success this host goes to standby."""
+    addr, key = setting("ho_addr", "").strip().rstrip("/"), setting("ho_key", "").strip()
+    if not addr.startswith("https://") or not key:
+        return False, "Set the other host's address (https://...) and its receive key first."
+    gz = _backup_make()
+    try:
+        with open(gz, "rb") as fh:
+            blob = fh.read()
+    finally:
+        try:
+            os.remove(gz)
+        except OSError:
+            pass
+    try:
+        _post_multipart(addr + "/transfer/receive", {"key": key}, "backup.db.gz", blob)
+    except urllib.error.HTTPError as e:
+        return False, "The other host refused: " + ("wrong receive key." if e.code == 403 else f"error {e.code}.")
+    except Exception as e:
+        return False, f"Could not reach the other host: {str(e)[:120]}"
+    set_setting("standby", "1")
+    return True, "Sent. The other host is now active and this one is in standby."
+
+
+def _ho_background(flask_app):
+    try:
+        with flask_app.app_context():
+            try:
+                ok, msg = handover_push()
+                if ok:
+                    set_setting("ho_done", setting("ru_period", ""))
+                    set_setting("ho_fails", "0")
+                    push_admins("🔁 Handed over to the other host", "Railway credit is nearly used. The other host now has your newest data and keeps posting.", url="/admin/backup", tag="handover")
+                else:
+                    n = (to_int(setting("ho_fails", "0"), 0) or 0) + 1
+                    set_setting("ho_fails", str(n))
+                    set_setting("ho_err", msg)
+                    if n in (1, 3):
+                        push_admins("⚠️ Hand-over failed" + (" (last try)" if n == 3 else ""), msg[:120], url="/admin/backup", tag="handover")
+            finally:
+                try:
+                    db().close()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+@bp.post("/admin/backup/rxkey")
+@admin_required
+def admin_backup_rxkey():
+    key = secrets.token_urlsafe(18)
+    set_setting("rx_hash", hashlib.sha256(key.encode()).hexdigest())
+    set_setting("rx_fails", "0|0")
+    flash(f"Receive key (shown only now, copy it): {key}")
+    flash(f"This host's address: {request.host_url.rstrip('/')}")
+    return redirect(url_for("web.admin_backup"))
+
+
+@bp.post("/admin/backup/rxoff")
+@admin_required
+def admin_backup_rxoff():
+    set_setting("rx_hash", "")
+    flash("This host no longer accepts hand-overs.")
+    return redirect(url_for("web.admin_backup"))
+
+
+@bp.post("/admin/backup/ho-save")
+@admin_required
+def admin_backup_ho_save():
+    f = request.form
+    set_setting("ho_on", "1" if f.get("on") else "0")
+    set_setting("ho_addr", f.get("addr", "").strip().rstrip("/")[:200])
+    if f.get("key", "").strip():
+        set_setting("ho_key", f["key"].strip()[:200])
+    pct = to_int(f.get("pct", "95"), 95) or 95
+    set_setting("ho_pct", str(min(max(pct, 80), 99)))
+    set_setting("ho_fails", "0")
+    set_setting("ho_done", "")
+    flash("Saved.")
+    return redirect(url_for("web.admin_backup"))
+
+
+@bp.post("/admin/backup/ho-check")
+@admin_required
+def admin_backup_ho_check():
+    addr, key = setting("ho_addr", "").strip().rstrip("/"), setting("ho_key", "").strip()
+    if not addr.startswith("https://") or not key:
+        flash("Set the other host's address (https://...) and its receive key first.")
+        return redirect(url_for("web.admin_backup"))
+    try:
+        urllib.request.urlopen(urllib.request.Request(addr + "/transfer/ping", data=urllib.parse.urlencode({"key": key}).encode(), method="POST"), timeout=30).read()
+        flash("✅ The other host answered and accepted the key.")
+    except urllib.error.HTTPError as e:
+        flash("The other host refused: " + ("wrong receive key (or it was not created yet)." if e.code == 403 else f"error {e.code}."))
+    except Exception as e:
+        flash(f"Could not reach the other host: {str(e)[:120]}")
+    return redirect(url_for("web.admin_backup"))
+
+
+@bp.post("/admin/backup/ho-now")
+@admin_required
+def admin_backup_ho_now():
+    if request.form.get("confirm", "").strip().upper() != "HANDOVER":
+        flash("Nothing sent. Type HANDOVER to confirm.")
+        return redirect(url_for("web.admin_backup"))
+    ok, msg = handover_push()
+    flash(("✅ " if ok else "❌ ") + msg)
     return redirect(url_for("web.admin_backup"))
